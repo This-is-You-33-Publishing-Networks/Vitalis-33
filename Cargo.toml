@@ -1,8 +1,8 @@
 [package]
 name = "vitalis"
-version = "59.0.0"
+version = "1333.0.0"
 edition = "2024"
-description = "Vitalis v22.0 — a JIT/AOT-compiled language with borrow checker, REPL, DAP debugger, trait dispatch, incremental compilation, async/await, generics, WASM, LSP, GPU compute, package manager, lifetime annotations, region analysis, effect system, capability types, hot-reload, self-hosted bootstrap, native AOT compilation, cross-compilation (x86_64, AArch64, RISC-V), 200+ stdlib functions, 24 algorithm libraries — native Cranelift JIT & AOT"
+description = "Vitalis \u2014 a JIT/AOT-compiled systems language built on Cranelift for autonomous code evolution, neuromorphic computing, and structured memory. 455 modules, 7,500 tests, 2,772 FFI exports. Pure Rust. No LLVM."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ModernOps888/vitalis"
 homepage = "https://github.com/ModernOps888/vitalis"
@@ -26,9 +26,11 @@ logos = "0.14"
 cranelift = "0.116"
 cranelift-module = "0.116"
 cranelift-jit = "0.116"
-cranelift-codegen = "0.116"
+# v118: Enable all-arch for cross-compilation (AArch64, RISC-V from x86_64 host)
+cranelift-codegen = { version = "0.116", features = ["all-arch"] }
 cranelift-frontend = "0.116"
 cranelift-native = "0.116"
+cranelift-object = "0.116"
 target-lexicon = "0.13"
 
 # Error reporting
@@ -46,6 +48,9 @@ indexmap = "2"
 
 # HTTP client (blocking)
 ureq = "2"
+
+# Native GUI framebuffer — zero-dep pixel window
+minifb = "0.28"
 
 [profile.release]
 opt-level = 3

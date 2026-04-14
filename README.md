@@ -2,6 +2,7 @@
 
 <!-- ═══════════════════════════════════════════════════════════ -->
 <!--                     VITALIS HEADER                         -->
+<!-- README last synced: 2026-04-14 (v1333 local codebase)      -->
 <!-- ═══════════════════════════════════════════════════════════ -->
 
 # 🧬 Vitalis
@@ -9,10 +10,10 @@
 ### The Self-Evolving Programming Language
 
 [![Rust](https://img.shields.io/badge/Rust-Edition_2024-b7410e?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/Tests-2%2C627_Passing-00c853?style=for-the-badge&logo=checkmarx&logoColor=white)](#-test-suite)
-[![LOC](https://img.shields.io/badge/LOC-110%2C000+-blue?style=for-the-badge&logo=slickpic&logoColor=white)](#-architecture)
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
-[![Version](https://img.shields.io/badge/v44.0.0-purple?style=for-the-badge&logo=v&logoColor=white)](#-changelog)
+[![Tests](https://img.shields.io/badge/Tests-7%2C500_Passing-00c853?style=for-the-badge&logo=checkmarx&logoColor=white)](#-test-suite)
+[![LOC](https://img.shields.io/badge/LOC-189%2C000+-blue?style=for-the-badge&logo=slickpic&logoColor=white)](#-architecture)
+[![License](https://img.shields.io/badge/License-MIT%20%7C%20Apache--2.0-yellow?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE-MIT)
+[![Modules](https://img.shields.io/badge/Modules-455-purple?style=for-the-badge&logo=v&logoColor=white)](#-architecture)
 
 **A compiled language purpose-built for autonomous AI code evolution.**<br>
 Vitalis compiles to native machine code via Cranelift JIT and AOT, with first-class support for<br>
@@ -38,28 +39,34 @@ self-modifying programs, genetic code evolution, and real-time fitness tracking.
 
 <table>
 <tr>
-<td width="25%" align="center">
+<td width="20%" align="center">
 
-**117**<br>
+**455**<br>
 <sub>Source modules</sub>
 
 </td>
-<td width="25%" align="center">
+<td width="20%" align="center">
 
-**110,000+**<br>
+**189,000+**<br>
 <sub>Lines of Rust</sub>
 
 </td>
-<td width="25%" align="center">
+<td width="20%" align="center">
 
-**2,627**<br>
+**7,500**<br>
 <sub>Tests passing</sub>
 
 </td>
-<td width="25%" align="center">
+<td width="20%" align="center">
 
-**412+**<br>
-<sub>Stdlib functions</sub>
+**5,557**<br>
+<sub>Public functions</sub>
+
+</td>
+<td width="20%" align="center">
+
+**2,772**<br>
+<sub>FFI exports</sub>
 
 </td>
 </tr>
@@ -120,7 +127,7 @@ flowchart TB
     subgraph CG ["⚡ STAGE 5 · CODEGEN"]
         direction TB
         C1["Cranelift 0.116 JIT"] --> C2["Register alloc · Instruction select"]
-        C2 --> C3["204 extern C runtime functions"]
+        C2 --> C3["2,772 extern C runtime functions"]
         C3 --> C4(["Native x86-64 machine code"])
     end
 
@@ -147,9 +154,9 @@ flowchart TB
 
 <br>
 
-### Module Map — 117 Modules
+### Module Map — 455 Modules
 
-Every source file has a single responsibility. The codebase is organized into **ten layers**:
+Every source file has a single responsibility. The codebase is organized into **twelve layers** spanning compiler infrastructure, AI/ML, neuromorphic computing, and systems programming:
 
 <table>
 <tr><td colspan="4" align="center"><h4>⚙️ Core Compiler Pipeline</h4></td></tr>
@@ -163,7 +170,7 @@ Every source file has a single responsibility. The codebase is organized into **
 <td><code>ir.rs</code><br><sub>SSA-form IR builder</sub></td>
 <td><code>codegen.rs</code><br><sub>Cranelift JIT backend</sub></td>
 <td><code>optimizer.rs</code><br><sub>IR optimization passes</sub></td>
-<td><code>stdlib.rs</code><br><sub>412+ built-in functions</sub></td>
+<td><code>stdlib.rs</code><br><sub>5,557 public functions</sub></td>
 </tr>
 <tr>
 <td><code>bridge.rs</code><br><sub>C FFI for Python</sub></td>
@@ -788,7 +795,7 @@ mindmap
 
 ## 📐 Standard Library
 
-### 412+ Built-in Functions
+### 5,557 Public Functions (2,772 FFI Exports)
 
 <details>
 <summary><b>🔢 Mathematics — 60+ functions</b></summary>
@@ -990,11 +997,11 @@ flowchart TB
 
 ## 🧪 Test Suite
 
-2,627 tests across every compiler stage and all subsystems through v44:
+7,500 tests across every compiler stage and all subsystems:
 
 ```
 $ cargo test
-test result: ok. 2627 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 7500 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 | Category | Count | Coverage |
@@ -1097,7 +1104,7 @@ vitalis/
 │   ├── types.rs              # Two-pass type checker with scope chains
 │   ├── ir.rs                 # SSA-form IR with 26+ instruction types
 │   ├── codegen.rs            # Cranelift JIT backend + 204 runtime functions
-│   ├── stdlib.rs             # 310+ built-in function registrations
+│   ├── stdlib.rs             # 5,557 public function registrations
 │   ├── optimizer.rs          # IR optimization passes
 │   ├── bridge.rs             # extern "C" FFI for Python/C interop
 │   ├── main.rs               # CLI binary (vtc) with clap subcommands
@@ -1502,6 +1509,40 @@ timeline
         : Continual learning (EWC, progressive nets, experience replay)
         : Federated learning (FedAvg, differential privacy, gossip)
         : 2,627 tests passing · 117 modules · 110,000+ LOC
+
+    v45–v60 · Systems Programming, GC, Distributed Primitives & Advanced Runtime
+        : Green threads runtime, tracing GC with concurrent marking
+        : KV store, database primitives, consensus protocols (Raft)
+        : Polyhedral optimization, parallel runtime, tiered JIT
+        : Dependent types, proof assistant, time-travel debugging
+        : Hardware synthesis, FPGA targets, embedded systems, RTOS
+        : Cloud deployment, service mesh, LLM compiler assist
+        : Computer vision, audio processing, certified compiler
+
+    v201–v300 · Neuromorphic Computing Era
+        : Spike engine with priority-queue event system
+        : Multi-compartment LIF/Izhikevich neurons
+        : Advanced synapse models (STP facilitation/depression)
+        : Wilson-Cowan population dynamics, neural mass models
+        : Loihi simulator, SNN learning (STDP, R-STDP)
+        : Hippocampal memory, processing-in-memory compute
+        : GPU-accelerated neuromorphic simulation
+        : Spike encoding/decoding (rate, temporal, phase coding)
+
+    v301–v600 · Domain Libraries & Cognitive Compiler
+        : 155 domain-specific modules (systems, ML, security, testing)
+        : Semantic graph engine, code reasoning, causal inference
+        : Compiler introspection, adaptive pipeline, workload prediction
+        : Root cause analysis, fault localization, auto-fix engine
+        : Neural parser, neural type inference, neural optimizer
+        : Spike scheduler, synaptic allocator, predictive execution
+
+    v601–v1333 · Research & Experimental Modules
+        : Cognitive compiler architecture (semantic understanding, self-aware optimization)
+        : Neural compilation pipeline (neural register allocation, scheduling)
+        : Structural scaffolds for consciousness, AGI, and meta-cognition research
+        : Post-singularity naming conventions (these modules are experimental placeholders)
+        : 7,500 tests passing · 455 modules · 189,000+ LOC
 ```
 
 <br>
