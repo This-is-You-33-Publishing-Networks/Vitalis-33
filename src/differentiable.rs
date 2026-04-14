@@ -5,7 +5,6 @@
 //! differentiable control flow, and custom vector-Jacobian product rules.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 // ── Dual Numbers (Forward-Mode AD) ──────────────────────────────────────
 

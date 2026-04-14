@@ -4,8 +4,6 @@
 //! Bloom filter, Count-Min Sketch, Trie, and finite state machines.
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
 
 // ─── Aho-Corasick Multi-Pattern Search ──────────────────────────────
 
@@ -14,7 +12,7 @@ struct AhoCorasick {
     goto: Vec<HashMap<u8, usize>>,
     fail: Vec<usize>,
     output: Vec<Vec<usize>>,  // pattern indices at each state
-    num_states: usize,
+    _num_states: usize,
 }
 
 impl AhoCorasick {
@@ -58,7 +56,7 @@ impl AhoCorasick {
             }
         }
 
-        AhoCorasick { goto, fail, output, num_states }
+        AhoCorasick { goto, fail, output, _num_states: num_states }
     }
 
     fn search(&self, text: &[u8]) -> Vec<(usize, usize)> {
@@ -117,7 +115,7 @@ pub unsafe extern "C" fn vitalis_aho_corasick(
 // ─── Bloom Filter ───────────────────────────────────────────────────
 
 /// Bloom filter state (opaque, managed via FFI).
-struct BloomFilter {
+pub struct BloomFilter {
     bits: Vec<bool>,
     num_hashes: usize,
     size: usize,
@@ -176,7 +174,7 @@ pub unsafe extern "C" fn vitalis_bloom_free(bf: *mut BloomFilter) {
 
 // ─── Count-Min Sketch ───────────────────────────────────────────────
 
-struct CountMinSketch {
+pub struct CountMinSketch {
     table: Vec<Vec<u64>>,
     width: usize,
     depth: usize,
@@ -355,7 +353,7 @@ struct TrieNode {
     is_end: bool,
 }
 
-struct Trie {
+pub struct Trie {
     nodes: Vec<TrieNode>,
 }
 

@@ -346,7 +346,7 @@ pub extern "C" fn slang_evo_list() -> *mut c_char {
             "[{}]",
             names
                 .iter()
-                .map(|n| format!("\"{}\"", n))
+                .map(|n| format!("\"{}\"" , json_escape(n)))
                 .collect::<Vec<_>>()
                 .join(",")
         );
@@ -599,8 +599,8 @@ pub unsafe extern "C" fn vitalis_memory_recall(tag: *const c_char, cycle: u64) -
             format!(
                 "{{\"id\":{},\"kind\":\"{}\",\"content\":\"{}\",\"importance\":{:.3},\"strength\":{:.3}}}",
                 e.id,
-                e.kind.name(),
-                e.content.replace('"', "\\\""),
+                json_escape(e.kind.name()),
+                json_escape(&e.content),
                 e.importance,
                 e.strength,
             )
@@ -841,5 +841,152 @@ mod tests {
             r#"fn main() -> i64 { error_clear(); error_set(99, "oops"); error_check() }"#,
         );
         assert_eq!(r.unwrap(), 99);
+    }
+
+    // ── v123: FFI Hardening Tests ──────────────────────────────────────
+
+    #[test]
+    fn test_ffi_null_source_compile() {
+        // Null error_out should not crash
+        let source = CString::new("fn main() -> i64 { 42 }").unwrap();
+        let result = unsafe { slang_compile_and_run(source.as_ptr(), std::ptr::null_mut()) };
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_ffi_check_with_errors() {
+        let source = CString::new("fn main() -> i64 { undefined_var }").unwrap();
+        let result = unsafe { slang_check(source.as_ptr()) };
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        // Should return a non-empty JSON array
+        assert!(s.starts_with('['));
+        assert!(s.len() > 2); // Not just "[]"
+        unsafe { slang_free_string(result) };
+    }
+
+    #[test]
+    fn test_ffi_dump_ir() {
+        let source = CString::new("fn main() -> i64 { 42 }").unwrap();
+        let result = unsafe { slang_dump_ir(source.as_ptr()) };
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert!(!s.is_empty());
+        unsafe { slang_free_string(result) };
+    }
+
+    #[test]
+    fn test_ffi_parse_ast() {
+        let source = CString::new("fn main() -> i64 { 42 }").unwrap();
+        let result = unsafe { slang_parse_ast(source.as_ptr()) };
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert!(s.contains("Function") || s.contains("main"));
+        unsafe { slang_free_string(result) };
+    }
+
+    #[test]
+    fn test_ffi_free_null() {
+        // Freeing a null pointer should be safe (no-op)
+        unsafe { slang_free_string(std::ptr::null_mut()) };
+        unsafe { slang_free_error(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_ffi_evo_list_empty() {
+        let result = slang_evo_list();
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        // Should be valid JSON array (may be [] or contain names)
+        assert!(s.starts_with('['));
+        assert!(s.ends_with(']'));
+        unsafe { slang_free_string(result) };
+    }
+
+    #[test]
+    fn test_ffi_engine_init() {
+        let result = vitalis_engine_init();
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn test_ffi_engine_stats() {
+        let result = vitalis_engine_stats();
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert!(s.starts_with('{') || s.starts_with('['));
+        unsafe { slang_free_string(result) };
+    }
+
+    #[test]
+    fn test_ffi_memory_count() {
+        let count = vitalis_memory_count();
+        // Should return a non-negative count
+        assert!(count < u64::MAX);
+    }
+
+    #[test]
+    fn test_ffi_memory_stats() {
+        let result = vitalis_memory_stats();
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert!(!s.is_empty());
+        unsafe { slang_free_string(result) };
+    }
+
+    #[test]
+    fn test_ffi_meta_strategy_count() {
+        let count = vitalis_meta_strategy_count();
+        assert!(count > 0); // Should have at least one strategy
+    }
+
+    #[test]
+    fn test_ffi_meta_select_strategy() {
+        let result = vitalis_meta_select_strategy();
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert!(!s.is_empty());
+        unsafe { slang_free_string(result) };
+    }
+
+    #[test]
+    fn test_ffi_meta_active_params() {
+        let result = vitalis_meta_active_params();
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert!(s.contains("mutation_rate"));
+        unsafe { slang_free_string(result) };
+    }
+
+    #[test]
+    fn test_ffi_json_escape_special_chars() {
+        let escaped = json_escape("hello \"world\"\nline\ttab\\back");
+        assert_eq!(escaped, "hello \\\"world\\\"\\nline\\ttab\\\\back");
+    }
+
+    #[test]
+    fn test_ffi_json_escape_nul() {
+        let escaped = json_escape("abc\0def");
+        assert_eq!(escaped, "abc\\u0000def");
+    }
+
+    #[test]
+    fn test_ffi_run_file_nonexistent() {
+        let path = CString::new("/nonexistent/file.sl").unwrap();
+        let mut error: *mut c_char = std::ptr::null_mut();
+        let result = unsafe { vitalis_run_file(path.as_ptr(), &mut error) };
+        assert_eq!(result, i64::MIN);
+        assert!(!error.is_null());
+        let err_str = unsafe { CStr::from_ptr(error) }.to_str().unwrap();
+        assert!(err_str.contains("cannot read file"));
+        unsafe { slang_free_error(error) };
+    }
+
+    #[test]
+    fn test_ffi_engine_diagnostics() {
+        let result = vitalis_engine_diagnostics();
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert!(!s.is_empty());
+        unsafe { slang_free_string(result) };
+    }
+
+    #[test]
+    fn test_ffi_meta_landscape() {
+        let result = vitalis_meta_landscape();
+        let s = unsafe { CStr::from_ptr(result) }.to_str().unwrap();
+        assert!(!s.is_empty());
+        unsafe { slang_free_string(result) };
     }
 }

@@ -350,14 +350,13 @@ pub fn parse_json_simple(text: &str, feature_keys: &[&str], label_key: &str) -> 
 
 fn parse_json_object(obj: &str, feature_keys: &[&str], label_key: &str) -> Option<Sample> {
     let mut features = Vec::new();
-    let mut label = None;
 
     for key in feature_keys {
         if let Some(val) = extract_json_number(obj, key) {
             features.push(val);
         }
     }
-    label = extract_json_number(obj, label_key);
+    let label = extract_json_number(obj, label_key);
 
     if features.is_empty() { return None; }
     Some(Sample::new(features, label))

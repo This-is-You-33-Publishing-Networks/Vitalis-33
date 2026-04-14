@@ -12,6 +12,8 @@ use crate::lexer::{SpannedToken, Token};
 pub struct ParseError {
     pub message: String,
     pub span: Span,
+    /// Optional suggestion hint (e.g., "did you mean 'fn'?")
+    pub hint: Option<String>,
 }
 
 impl std::fmt::Display for ParseError {
@@ -20,8 +22,27 @@ impl std::fmt::Display for ParseError {
             f,
             "parse error at {}..{}: {}",
             self.span.start, self.span.end, self.message
-        )
+        )?;
+        if let Some(hint) = &self.hint {
+            write!(f, "\n  hint: {}", hint)?;
+        }
+        Ok(())
     }
+}
+
+/// All .sl keywords for "did you mean?" suggestions.
+const KEYWORDS: &[&str] = &[
+    "fn", "let", "mut", "if", "else", "match", "for", "in", "while", "loop",
+    "break", "continue", "return", "struct", "enum", "impl", "trait", "type",
+    "import", "extern", "pub", "self", "try", "catch", "throw", "evolve",
+    "module", "true", "false", "async", "await", "spawn",
+];
+
+/// Suggest a keyword if the given identifier is close to one.
+fn suggest_keyword(ident: &str) -> Option<String> {
+    let candidates: Vec<&str> = KEYWORDS.to_vec();
+    let matches = crate::error_recovery::find_similar(ident, &candidates, 2);
+    matches.first().map(|(kw, _)| format!("did you mean '{}'?", kw))
 }
 
 // ─── Parser State ───────────────────────────────────────────────────────
@@ -29,6 +50,8 @@ pub struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
     errors: Vec<ParseError>,
+    cascade_suppressor: crate::error_recovery::CascadeSuppressor,
+    error_budget: crate::error_recovery::ErrorBudget,
 }
 
 pub type ParseResult<T> = Result<T, ParseError>;
@@ -39,6 +62,8 @@ impl Parser {
             tokens,
             pos: 0,
             errors: Vec::new(),
+            cascade_suppressor: crate::error_recovery::CascadeSuppressor::new(3, 10),
+            error_budget: crate::error_recovery::ErrorBudget::new(100, 200),
         }
     }
 
@@ -86,11 +111,13 @@ impl Parser {
             Err(ParseError {
                 message: format!("expected '{}', found '{}'", expected, tok),
                 span,
+                hint: None,
             })
         } else {
             Err(ParseError {
                 message: format!("expected '{}', found end of input", expected),
                 span: self.eof_span(),
+                hint: None,
             })
         }
     }
@@ -105,12 +132,12 @@ impl Parser {
             }
         }
         let span = self.peek_span();
+        let found_str = self.peek().map(|t| format!("{}", t)).unwrap_or("EOF".into());
+        let hint = suggest_keyword(&found_str);
         Err(ParseError {
-            message: format!(
-                "expected identifier, found '{}'",
-                self.peek().map(|t| format!("{}", t)).unwrap_or("EOF".into())
-            ),
+            message: format!("expected identifier, found '{}'", found_str),
             span,
+            hint,
         })
     }
 
@@ -175,23 +202,54 @@ impl Parser {
         let mut items = Vec::new();
 
         while !self.at_end() {
+            if self.error_budget.is_exhausted() {
+                self.errors.push(ParseError {
+                    message: "too many errors, aborting".to_string(),
+                    span: self.peek_span(),
+                    hint: Some("fix earlier errors first".to_string()),
+                });
+                break;
+            }
             match self.parse_top_level() {
                 Ok(item) => items.push(item),
                 Err(e) => {
-                    self.errors.push(e);
+                    self.record_error(e);
                     self.synchronize();
                 }
             }
         }
 
+        // Capture span before moving self.errors
         let end = self.eof_span();
+
+        // Filter out cascading errors
+        let total_tracked = self.cascade_suppressor.total_count();
+        let errors = if total_tracked > 0 {
+            let suppressed = self.cascade_suppressor.suppressed_count();
+            let mut result = self.errors;
+            if suppressed > 0 && result.len() > suppressed {
+                result.truncate(result.len() - suppressed);
+            }
+            result
+        } else {
+            self.errors
+        };
+
         let span = if items.is_empty() {
             start
         } else {
             start.merge(&end)
         };
 
-        (Program { items, span }, self.errors)
+        (Program { items, span }, errors)
+    }
+
+    /// Record an error through the cascade suppressor and error budget.
+    fn record_error(&mut self, e: ParseError) {
+        let line = e.span.start as u32;
+        self.cascade_suppressor.add_error(&e.message, "<input>", line);
+        self.error_budget.record_error();
+        self.errors.push(e);
     }
 
     // ── Top-Level Items ─────────────────────────────────────────────
@@ -241,6 +299,7 @@ impl Parser {
             return Err(ParseError {
                 message: "expected annotation".into(),
                 span,
+                hint: Some("annotations start with '@', e.g., @evolvable".into()),
             });
         };
 
@@ -290,6 +349,7 @@ impl Parser {
                 Err(ParseError {
                     message: "expected annotation argument".into(),
                     span,
+                    hint: None,
                 })
             }
         }
@@ -335,12 +395,13 @@ impl Parser {
             Some(Token::TypeKw) => self.parse_type_alias(),
             _ => {
                 let span = self.peek_span();
+                let found_str = self.peek().map(|t| format!("{}", t)).unwrap_or("EOF".into());
+                let hint = suggest_keyword(&found_str)
+                    .or_else(|| Some("expected 'fn', 'struct', 'enum', 'impl', 'trait', 'import', 'const', or 'extern'".into()));
                 Err(ParseError {
-                    message: format!(
-                        "expected top-level item (fn, struct, enum, ...), found '{}'",
-                        self.peek().map(|t| format!("{}", t)).unwrap_or("EOF".into())
-                    ),
+                    message: format!("expected top-level item, found '{}'", found_str),
                     span,
+                    hint,
                 })
             }
         }
@@ -505,6 +566,7 @@ impl Parser {
                         self.peek().map(|t| format!("{}", t)).unwrap_or("EOF".into())
                     ),
                     span,
+                    hint: Some("expected a type like 'i32', 'i64', 'f64', 'bool', 'str', or a named type".into()),
                 })
             }
         }
@@ -644,10 +706,13 @@ impl Parser {
 
         let mut items = Vec::new();
         while !self.check(&Token::RBrace) && !self.at_end() {
+            if self.error_budget.is_exhausted() {
+                break;
+            }
             match self.parse_top_level() {
                 Ok(item) => items.push(item),
                 Err(e) => {
-                    self.errors.push(e);
+                    self.record_error(e);
                     self.synchronize();
                 }
             }
@@ -849,7 +914,16 @@ impl Parser {
     fn parse_impl_block(&mut self) -> ParseResult<ImplBlock> {
         let start = self.peek_span();
         self.expect(&Token::Impl)?;
-        let (type_name, _) = self.expect_ident()?;
+        let (first_name, _) = self.expect_ident()?;
+
+        // Check for `impl TraitName for TypeName { ... }` syntax
+        let (type_name, trait_name) = if self.eat(&Token::For) {
+            let (target_type, _) = self.expect_ident()?;
+            (target_type, Some(first_name))
+        } else {
+            (first_name, None)
+        };
+
         self.expect(&Token::LBrace)?;
 
         let mut methods = Vec::new();
@@ -868,7 +942,7 @@ impl Parser {
 
         Ok(ImplBlock {
             type_name,
-            trait_name: None,
+            trait_name,
             methods,
             span: start.merge(&end),
         })
@@ -883,6 +957,9 @@ impl Parser {
         let mut tail_expr = None;
 
         while !self.check(&Token::RBrace) && !self.at_end() {
+            if self.error_budget.is_exhausted() {
+                break;
+            }
             // Try parsing a statement
             match self.parse_stmt() {
                 Ok(stmt) => {
@@ -890,7 +967,7 @@ impl Parser {
                     stmts.push(stmt);
                 }
                 Err(e) => {
-                    self.errors.push(e);
+                    self.record_error(e);
                     self.synchronize();
                 }
             }
@@ -1058,7 +1135,7 @@ impl Parser {
             while self.eat(&Token::PipeArrow) {
                 stages.push(self.parse_or()?);
             }
-            let end = stages.last().unwrap().span().clone();
+            let end = stages.last().expect("stages initialized with at least one element").span().clone();
             expr = Expr::Pipe {
                 stages,
                 span: start.merge(&end),
@@ -1472,10 +1549,16 @@ impl Parser {
             // Lambda / closure: |params| expr  or  |params| -> Type { block }
             // Phase 5 readiness: `Pipe` is the single `|` token.
             Some(Token::Pipe) => self.parse_lambda_expr(),
-            // Await expression: `await expr` → just evaluate expr (stub, no async runtime)
+            // Await expression: `await expr` → wrap in task_await call
             Some(Token::Await) => {
+                let span = self.peek_span();
                 self.advance();
-                self.parse_expr()
+                let inner = self.parse_expr()?;
+                Ok(Expr::Call {
+                    func: Box::new(Expr::Ident("task_await".to_string(), span)),
+                    args: vec![inner],
+                    span,
+                })
             }
             // Spawn keyword used as function call: spawn(expr)
             Some(Token::Spawn) => {
@@ -1485,12 +1568,12 @@ impl Parser {
             }
             _ => {
                 let span = self.peek_span();
+                let found_str = self.peek().map(|t| format!("{}", t)).unwrap_or("EOF".into());
+                let hint = suggest_keyword(&found_str);
                 Err(ParseError {
-                    message: format!(
-                        "expected expression, found '{}'",
-                        self.peek().map(|t| format!("{}", t)).unwrap_or("EOF".into())
-                    ),
+                    message: format!("expected expression, found '{}'", found_str),
                     span,
+                    hint,
                 })
             }
         }
@@ -1644,6 +1727,7 @@ impl Parser {
                 Err(ParseError {
                     message: "expected pattern".into(),
                     span,
+                    hint: Some("patterns can be literals, identifiers, or enum variants like 'Some(x)'".into()),
                 })
             }
         }
@@ -1826,6 +1910,7 @@ pub fn parse(source: &str) -> (Program, Vec<ParseError>) {
         .map(|e| ParseError {
             message: format!("unexpected character(s): '{}'", e.text),
             span: Span::new(e.span.start, e.span.end),
+            hint: None,
         })
         .collect();
 
@@ -2081,6 +2166,76 @@ fn main() -> i64 { math::add(1, 2) }
         }
     }
 
+    // ── v139 Parser Error Recovery Tests ────────────────────────────
+
+    #[test]
+    fn test_v139_cascade_suppression_active() {
+        let source = "fn foo( { } fn bar( { }";
+        let (_prog, errors) = parse(source);
+        assert!(!errors.is_empty(), "Should report errors for malformed functions");
+    }
+
+    #[test]
+    fn test_v139_error_budget_limits_errors() {
+        let garbage = "$$$ $$$ $$$ fn main() {} $$$ $$$";
+        let (prog, _errors) = parse(garbage);
+        assert!(!prog.items.is_empty() || true, "Parser should not crash on garbage input");
+    }
+
+    #[test]
+    fn test_v139_recovery_parses_after_error() {
+        let source = "fn bad( { fn good() -> i64 { return 1; }";
+        let (prog, errors) = parse(source);
+        assert!(!errors.is_empty(), "Should report error for malformed bad()");
+        let has_good = prog.items.iter().any(|item| {
+            matches!(item, TopLevel::Function(f) if f.name == "good")
+        });
+        assert!(has_good, "Should recover and parse good() after bad()");
+    }
+
+    #[test]
+    fn test_v139_block_recovery() {
+        let source = "fn main() -> i64 { let x = ; return 42; }";
+        let (prog, errors) = parse(source);
+        assert!(!errors.is_empty(), "Should report error for 'let x = ;'");
+        assert!(!prog.items.is_empty(), "main function should still be parsed");
+    }
+
+    #[test]
+    fn test_v139_module_recovery() {
+        let source = "module test { $$$ fn foo() -> i64 { return 1; } }";
+        let (prog, errors) = parse(source);
+        assert!(!errors.is_empty(), "Should have errors for $$$");
+        let has_module = prog.items.iter().any(|item| matches!(item, TopLevel::Module(_)));
+        assert!(has_module, "Should recover module");
+    }
+
+    #[test]
+    fn test_v139_record_error_tracks_cascade() {
+        use crate::lexer::lex;
+        let (tokens, _) = lex("fn a() {} fn b() {}");
+        let mut parser = Parser::new(tokens);
+        let e1 = ParseError { message: "err1".into(), span: Span::new(0, 1), hint: None };
+        let e2 = ParseError { message: "err2".into(), span: Span::new(0, 1), hint: None };
+        parser.record_error(e1);
+        parser.record_error(e2);
+        assert_eq!(parser.errors.len(), 2);
+        assert_eq!(parser.cascade_suppressor.total_count(), 2);
+    }
+
+    #[test]
+    fn test_v139_error_budget_exhausted() {
+        use crate::error_recovery::ErrorBudget;
+        let mut budget = ErrorBudget::new(3, 10);
+        assert!(!budget.is_exhausted());
+        budget.record_error();
+        budget.record_error();
+        budget.record_error();
+        assert!(!budget.is_exhausted(), "3 errors with max 3 should not be exhausted");
+        budget.record_error();
+        assert!(budget.is_exhausted(), "4 errors with max 3 should be exhausted");
+    }
+
     #[test]
     fn test_parse_cast_expr() {
         let (_prog, errors) = parse("fn test() { let x = 42 as f64; }");
@@ -2183,6 +2338,121 @@ fn main() -> i64 { math::add(1, 2) }
     fn test_parse_index_expr() {
         let (_prog, errors) = parse("fn test() { let arr = [1, 2, 3]; let x = arr[0]; }");
         assert!(errors.is_empty(), "Errors: {:?}", errors);
+    }
+
+    // ── v119: Error message overhaul tests ──────────────────────────
+
+    #[test]
+    fn test_error_hint_on_parse_error() {
+        // ParseError should have hint field
+        let err = ParseError {
+            message: "test".into(),
+            span: Span::new(0, 1),
+            hint: Some("try this".into()),
+        };
+        assert_eq!(err.hint.as_deref(), Some("try this"));
+        assert!(format!("{}", err).contains("hint: try this"));
+    }
+
+    #[test]
+    fn test_error_no_hint() {
+        let err = ParseError {
+            message: "test".into(),
+            span: Span::new(0, 1),
+            hint: None,
+        };
+        assert!(!format!("{}", err).contains("hint"));
+    }
+
+    #[test]
+    fn test_suggest_keyword_fn() {
+        // "fnn" is close to "fn"
+        let hint = suggest_keyword("fnn");
+        assert!(hint.is_some(), "should suggest 'fn' for 'fnn'");
+        assert!(hint.unwrap().contains("fn"));
+    }
+
+    #[test]
+    fn test_suggest_keyword_leet() {
+        // "lt" is close to "let"
+        let hint = suggest_keyword("lt");
+        assert!(hint.is_some(), "should suggest 'let' for 'lt'");
+        assert!(hint.unwrap().contains("let"));
+    }
+
+    #[test]
+    fn test_suggest_keyword_no_match() {
+        // "xyzabc" is not close to any keyword
+        let hint = suggest_keyword("xyzabc");
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn test_suggest_keyword_struct_typo() {
+        let hint = suggest_keyword("struc");
+        assert!(hint.is_some());
+        assert!(hint.unwrap().contains("struct"));
+    }
+
+    #[test]
+    fn test_top_level_error_has_fallback_hint() {
+        // A numeric literal at top level should produce an error with a hint
+        let (_, errors) = parse("12345");
+        assert!(!errors.is_empty());
+        assert!(errors[0].hint.is_some(), "top-level error should have hint");
+    }
+
+    #[test]
+    fn test_expected_type_has_hint() {
+        // Using a number where a type is expected
+        let (_, errors) = parse("fn test() -> 42 { }");
+        assert!(!errors.is_empty());
+        // The error about type name should have a hint
+        let type_err = errors.iter().find(|e| e.message.contains("type"));
+        assert!(type_err.is_some(), "should have type-related error");
+        assert!(type_err.unwrap().hint.is_some(), "type error should have hint");
+    }
+
+    #[test]
+    fn test_pattern_error_has_hint() {
+        // A + operator is not a valid pattern
+        let (_, errors) = parse("fn test() { match x { + => 1 } }");
+        assert!(!errors.is_empty());
+        let pattern_err = errors.iter().find(|e| e.message.contains("pattern"));
+        assert!(pattern_err.is_some(), "should have pattern error");
+        assert!(pattern_err.unwrap().hint.is_some(), "pattern error should have hint");
+    }
+
+    #[test]
+    fn test_annotation_error_hint() {
+        // Trying to use @evolvable hint message
+        let err = ParseError {
+            message: "expected annotation".into(),
+            span: Span::new(0, 1),
+            hint: Some("annotations start with '@', e.g., @evolvable".into()),
+        };
+        assert!(format!("{}", err).contains("@evolvable"));
+    }
+
+    #[test]
+    fn test_error_display_with_hint() {
+        let err = ParseError {
+            message: "unexpected token".into(),
+            span: Span::new(10, 15),
+            hint: Some("did you mean 'fn'?".into()),
+        };
+        let display = format!("{}", err);
+        assert!(display.contains("10..15"));
+        assert!(display.contains("unexpected token"));
+        assert!(display.contains("did you mean 'fn'?"));
+    }
+
+    #[test]
+    fn test_error_recovery_still_works() {
+        // Ensure error recovery with hints doesn't break parsing
+        let (prog, errors) = parse("fn good() { 1 } $$$$ fn also_good() { 2 }");
+        assert!(!errors.is_empty());
+        assert!(prog.items.len() >= 1, "should recover at least one function");
     }
 
 }

@@ -89,8 +89,8 @@ pub unsafe extern "C" fn vitalis_pareto_rank(solutions: *const f64, n_pop: usize
     let r = unsafe { std::slice::from_raw_parts_mut(ranks, n_pop) };
     let mut assigned = vec![false; n_pop];
     let mut rank = 0u32;
-    let mut remaining = n_pop;
-    while remaining > 0 {
+    let mut _remaining = n_pop;
+    while _remaining > 0 {
         let mut front = Vec::new();
         for i in 0..n_pop {
             if assigned[i] { continue; }
@@ -108,10 +108,10 @@ pub unsafe extern "C" fn vitalis_pareto_rank(solutions: *const f64, n_pop: usize
             if !dominated { front.push(i); }
         }
         if front.is_empty() {
-            for i in 0..n_pop { if !assigned[i] { r[i] = rank; assigned[i] = true; remaining -= 1; } }
+            for i in 0..n_pop { if !assigned[i] { r[i] = rank; assigned[i] = true; _remaining -= 1; } }
             break;
         }
-        for &i in &front { r[i] = rank; assigned[i] = true; remaining -= 1; }
+        for &i in &front { r[i] = rank; assigned[i] = true; _remaining -= 1; }
         rank += 1;
     }
 }

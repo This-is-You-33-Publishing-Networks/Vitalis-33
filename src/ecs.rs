@@ -8,8 +8,6 @@
 //! - System scheduling with dependency resolution
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
 
 // ─── Entity ─────────────────────────────────────────────────────────
 
@@ -214,7 +212,7 @@ impl QueryFilter {
 // ─── World ──────────────────────────────────────────────────────────
 
 /// The ECS World — central container for all entities, components, and systems.
-struct World {
+pub struct World {
     /// Entity generations for recycling
     entity_generations: Vec<u32>,
     /// Free list of recycled entity indices (LIFO)

@@ -240,7 +240,7 @@ pub struct CodeOptEnv {
 
 impl CodeOptEnv {
     pub fn new(param_names: Vec<String>, bounds: Vec<(f64, f64)>) -> Self {
-        let n = param_names.len();
+        let _n = param_names.len();
         let params: Vec<f64> = bounds.iter().map(|(lo, hi)| (lo + hi) / 2.0).collect();
         CodeOptEnv {
             params,

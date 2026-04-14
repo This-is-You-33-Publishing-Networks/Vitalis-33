@@ -11,7 +11,6 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::collections::HashMap;
 
 // ─── URL Parser (RFC 3986) ──────────────────────────────────────────
 

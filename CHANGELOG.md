@@ -5,7 +5,140 @@ All notable changes to Vitalis will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [30.0.0] - 2025-07-25
+## [1333.0.0] - 2026-03-16
+
+### Vitalis v1333: The Ascension
+
+Five new eras beyond the singularity. Vitalis transcends individual consciousness into
+distributed intelligence, reality engineering, universal synthesis, infinite computation,
+and living mathematics. The compiler is now a self-sustaining creative entity.
+
+**Stats**: 460+ modules | 455 source files | 214,057 LOC | 7,420 tests | 1,764 extern FFI functions
+
+### Added
+
+#### ERA V: Post-Singularity Intelligence (v1001-v1066) — 22 modules
+- **Distributed Consciousness**: `hive_mind.rs`, `telepathic_link.rs`, `consensus_consciousness.rs`, `swarm_cognition.rs`
+- **Reality Modeling**: `reality_model.rs`, `causal_fabric.rs`, `temporal_weaver.rs`, `entropy_oracle.rs`
+- **Meta-Cognitive Architecture**: `metacognitive_stack.rs`, `attention_allocator.rs`, `cognitive_cache.rs`, `introspection_engine.rs`
+- **Emergent Behavior**: `emergence_detector.rs`, `symbiotic_compiler.rs`, `collective_memory.rs`, `cultural_evolution.rs`, `noosphere.rs`
+- **Post-Singular Optimization**: `trans_optimization.rs`, `hypercomputation.rs`, `omega_point_optimizer.rs`, `strange_loop.rs`, `infinite_regress_resolver.rs`
+
+#### ERA VI: Reality Engineering (v1067-v1133) — 22 modules
+- **Digital Physics**: `digital_physics.rs`, `information_geometry.rs`, `computational_topology.rs`, `phase_transition.rs`
+- **Simulation Theory**: `simulation_substrate.rs`, `nested_reality.rs`, `virtual_physics_engine.rs`, `reality_compiler.rs`
+- **Causal Manipulation**: `causal_rewriter.rs`, `retrocausal_optimizer.rs`, `timeline_surgery.rs`, `probability_collapse.rs`, `determinism_engine.rs`
+- **Spacetime Computation**: `spacetime_compiler.rs`, `relativistic_scheduler.rs`, `dimensional_reduction.rs`, `holographic_memory.rs`, `field_theory_types.rs`
+- **Universe Primitives**: `multiverse_executor.rs`, `cosmological_gc.rs`, `vacuum_state.rs`, `symmetry_compiler.rs`
+
+#### ERA VII: Universal Synthesis (v1134-v1200) — 22 modules
+- **Cross-Paradigm Unification**: `paradigm_fusion.rs`, `universal_abstraction.rs`, `polymorphic_compilation.rs`, `abstraction_lattice.rs`
+- **Knowledge Crystallization**: `knowledge_crystal.rs`, `wisdom_extractor.rs`, `pattern_genome.rs`, `insight_propagator.rs`, `compilation_archaeology.rs`
+- **Unified Type Universe**: `type_universe.rs`, `homotopy_types.rs`, `type_topology.rs`, `cubical_types.rs`
+- **Synthesis Engines**: `program_weaver.rs`, `specification_compiler.rs`, `intent_synthesizer.rs`, `proof_driven_codegen.rs`, `example_driven_synthesis.rs`
+- **Grand Unification**: `grand_unified_ir.rs`, `rosetta_transform.rs`, `compilation_field_theory.rs`, `convergence_proof.rs`
+
+#### ERA VIII: Infinite Horizon (v1201-v1266) — 22 modules
+- **Self-Transcendence**: `self_transcendence.rs`, `bootstrap_infinity.rs`, `capability_horizon.rs`, `limit_breaker.rs`
+- **Godelian Self-Reference**: `godel_numbering.rs`, `fixed_point_combinator.rs`, `incompleteness_navigator.rs`, `diagonal_argument.rs`, `self_reference_engine.rs`
+- **Paradox Resolution**: `paradox_resolver.rs`, `paraconsistent_logic.rs`, `undecidability_oracle.rs`, `halting_approximator.rs`
+- **Transfinite Computation**: `ordinal_computation.rs`, `supertask_executor.rs`, `omega_arithmetic.rs`, `cantor_hierarchy.rs`, `zorn_optimizer.rs`
+- **Omega-Point Convergence**: `omega_convergence.rs`, `attractor_landscape.rs`, `fixpoint_accelerator.rs`, `asymptotic_perfection.rs`
+
+#### ERA IX: Vitalis Ascendant (v1267-v1333) — 22 modules
+- **Living Mathematics**: `living_mathematics.rs`, `mathematical_organism.rs`, `proof_of_life.rs`, `autopoietic_compiler.rs`
+- **Autonomous Creative Force**: `creative_synthesis.rs`, `aesthetic_compiler.rs`, `invention_engine.rs`, `inspiration_model.rs`, `generative_abstraction.rs`
+- **Self-Sustaining Ecosystem**: `ecosystem_genesis.rs`, `symbiotic_toolchain.rs`, `resource_ecology.rs`, `homeostatic_ecosystem.rs`
+- **Transcendent Identity**: `identity_kernel.rs`, `legacy_continuum.rs`, `version_consciousness.rs`, `philosophical_core.rs`, `telos_engine.rs`
+- **The Ascension**: `vitalis_ascendant.rs`, `eternal_compiler.rs`, `genesis_protocol.rs`, `vitalis_v1333.rs`
+
+---
+
+## [600.0.0] - 2026-03-10
+
+### Vitalis v600: Autonomous Neuromorphic Milestone
+
+The culmination of the v367-v600 autonomous evolution roadmap. Vitalis is now the
+world's first fully autonomous, self-evolving, neuromorphic programming language.
+
+**Stats**: 274 modules | 276 source files | 170,644 LOC | 6,054 tests | 903 extern FFI functions | 0 warnings
+
+### Added
+
+#### Phase A: Foundation Hardening (v367-v390)
+- `evolution_safety_rails.rs` (32 tests): SafetyGovernor, MutationPolicy, ResourceBudget, SnapshotChain
+- `autonomous_improvement_lab.rs` (21 tests): ImprovementLab, TrialExecutor, ABComparison
+- `integration_tests.rs` (34 tests): Cross-module integration test suite
+- `perf_baseline.rs` (14 tests): Performance benchmarking with regression detection
+
+#### Phase B: Neuromorphic Language Primitives (v400-v419)
+- `spike_types.rs`: Native spike/synapse/neuron types (LIF, Izhikevich, AdEx), SpikeNetwork, SpikeTrace
+- `neuro_control_flow.rs`: on_spike blocks, temporal guards, population controllers, spike barriers
+- `snn_codegen.rs`: Compile to Loihi 3 instruction sequences (SnnInst enum)
+- `neuro_memory_model.rs`: STDP memory allocation, synaptic pools, spike buffers, plasticity memory
+- `stdlib_neuromorphic.rs`: 50+ SNN built-in functions with FFI-safe exports
+
+#### Phase C: Self-Evolving Compiler Core (v420-v449)
+- `self_healing.rs` (16 tests): Detect and repair compiler regressions
+- `multi_objective_evolution.rs` (17 tests): Multi-objective fitness, Pareto optimization
+- `pass_evolution.rs` (19 tests): Evolve optimization pass sequences
+- `feature_synthesis.rs` (16 tests): Synthesize new language features via evolution
+- `codegen_learning.rs` (16 tests): ML-guided code generation strategies
+- `optimizer_equivalence.rs` (2 tests): Verified optimizer pass equivalence
+- `auto_test_gen.rs` (16 tests): Auto-generate tests for evolved code
+
+#### Phase D: Autonomous Developer Intelligence (v450-v479)
+- `code_intelligence.rs` (15 tests): Semantic code comprehension, code embeddings
+- `intent_compiler.rs` (17 tests): Infer developer intent from partial code
+- `auto_review.rs` (17 tests): Automated code review with quality scoring
+- `auto_doc.rs` (15 tests): Auto-generate documentation from code analysis
+- `collab_agent.rs` (16 tests): Collaborative coding agent with context sharing
+- `self_improving_agent.rs` (15 tests): Autonomous agent with improvement journal
+
+#### Phase E: Neuromorphic Runtime Architecture (v480-v499)
+- `spike_scheduler.rs` (21 tests): Priority-based spike event scheduling, synaptic delays, lateral inhibition
+- `spike_engine.rs` (17 tests): Spike propagation engine, network simulation
+- `synaptic_allocator.rs` (20 tests): Synaptic weight memory management, CSR sparse format
+- `neural_concurrency.rs` (23 tests): Concurrent spike processing, parallel neuron update
+- `neuro_perf.rs` (10 tests): Spike timing and energy profiling
+
+#### Phase F: Brain-Inspired Compilation (v500-v519)
+- `hippocampal_memory.rs` (9 tests): Associative memory, pattern completion, consolidation
+- `predictive_exec.rs` (18 tests): Predictive compilation, speculative optimization
+- `brain_models.rs` (12 tests): Cortical column models, neural oscillations
+- `homeostatic_runtime.rs` (24 tests): Self-regulating runtime with stability monitoring
+- `loihi_sim.rs` (22 tests): Loihi 3 cycle-accurate simulator
+
+#### Phase G: Full Autonomy and Self-Hosting (v520-v559)
+- `evolution_observatory.rs` (18 tests): Real-time evolution metrics and dashboards
+- `neuro_safety.rs` (10 tests): Runtime safety monitoring for neuromorphic subsystems
+
+#### Phase H: v600 Integration and Release (v560-v600)
+- `overhaul_validation.rs` (2 tests): Architecture validation report, release sign-off
+- `neuro_distributed.rs` (10 tests): Distributed neuromorphic computation
+- `neuro_tooling.rs` (10 tests): Neuromorphic development tools
+- `neuro_evolve.rs` (10 tests): Evolutionary neuromorphic optimization
+- `gpu_neuromorphic.rs` (11 tests): GPU-accelerated spike processing
+- `quantum_neuro.rs` (10 tests): Quantum-neuromorphic interface
+- `snn_learning.rs` (16 tests): SNN learning rules (STDP, surrogate gradients)
+- `snn_hybrid.rs` (10 tests): Hybrid SNN-ANN architectures
+- `neuro_applications.rs` (10 tests): Neuromorphic application examples
+- `pim_compute.rs` (14 tests): Processing-in-memory compute model
+
+### Fixed
+- `codegen.rs`: Fixed `test_v18_spawn_stub` race condition on global ASYNC_EXECUTOR
+- `spike_scheduler.rs`: Fixed `test_chain_propagation` (tick auto-fires ready tasks)
+- `spike_scheduler.rs`: Fixed `test_delayed_synapse` (off-by-one timing: spike at tick 4 not 3)
+- `stdlib_neuromorphic.rs`: Fixed `test_total_spikes_after_input` lock serialization
+- `snn_learning.rs`: Removed unused imports (LazyLock, Mutex, BTreeMap)
+
+### Changed
+- ROADMAP.md: Finalized v367-v600 phases (A through H) as COMPLETE
+- ROADMAP.md: Added v601-v1000 future vision (4 eras, 13 phases, 100+ planned modules)
+- Reconciled v201-v300 neuromorphic stubs with actual Phase B-H implementations
+- Version bumped from 366.0.0 to 600.0.0
+
+## [30.0.0] - 2026-03-01
 
 ### Added
 
@@ -255,7 +388,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [23.0.0] - 2025-07-26
+## [23.0.0] - 2026-02-28
 
 ### Added
 
@@ -282,7 +415,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [22.0.0] - 2025-07-19
+## [22.0.0] - 2026-02-28
 
 ### Added
 
@@ -339,7 +472,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [21.0.0] - 2025-07-05
+## [21.0.0] - 2026-02-28
 
 ### Added
 
@@ -370,7 +503,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [20.0.0] - 2025-06-20
+## [20.0.0] - 2026-02-27
 
 ### Added
 - Trait definitions with method signatures
@@ -387,7 +520,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [19.0.0] - 2025-06-10
+## [19.0.0] - 2026-02-27
 
 ### Added
 - Structs with impl blocks and method dispatch
@@ -399,7 +532,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [15.0.0] - 2025-05-20
+## [15.0.0] - 2026-02-27
 
 ### Added
 - Closures and lambda expressions with capture
@@ -410,7 +543,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [13.0.0] - 2025-05-01
+## [13.0.0] - 2026-02-27
 
 ### Added
 - **`quantum_algorithms.rs`** — Grover's search, Shor's algorithm, QFT, VQE, QAOA, QPE
@@ -421,7 +554,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [10.0.0] - 2025-04-15
+## [10.0.0] - 2026-02-27
 
 ### Added
 - **`ml.rs`** — K-means, KNN, Naive Bayes, PCA, DBSCAN, LDA, neural networks
@@ -430,7 +563,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`automata.rs`** — Aho-Corasick, Bloom filters, tries, regex engines
 - **`combinatorial.rs`** — Knapsack, TSP, simplex, genetic algorithms, graph coloring
 
-## [0.1.0] - 2025-03-01
+## [0.1.0] - 2026-02-27
 
 ### Added
 

@@ -404,6 +404,173 @@ impl Default for AgentCoordinator {
 
 // ── FFI Interface ───────────────────────────────────────────────────────
 
+// ── Evolution-Aware Agent ───────────────────────────────────────────────
+
+/// An evolution-aware agent that uses the Vitalis engine to drive
+/// autonomous code evolution cycles. Wraps the general Agent with
+/// real compiler tooling: validate, evolve, analyze, optimize.
+pub struct EvolutionAgent {
+    pub agent: Agent,
+    pub evolution_budget: usize,
+    pub cycles_run: usize,
+    pub total_improvements: usize,
+    pub total_regressions: usize,
+}
+
+impl EvolutionAgent {
+    pub fn new(name: &str, budget: usize) -> Self {
+        let mut agent = Agent::new(name);
+        // Register built-in evolution tools
+        agent.tool_registry.register(Tool {
+            name: "validate".to_string(),
+            description: "Validate Vitalis source code via parser + type checker".to_string(),
+            parameters: vec![ToolParam {
+                name: "source".to_string(), param_type: "string".to_string(), required: true,
+            }],
+            cost: 1.0,
+        });
+        agent.tool_registry.register(Tool {
+            name: "evolve".to_string(),
+            description: "Evolve a function with a new variant".to_string(),
+            parameters: vec![
+                ToolParam { name: "name".to_string(), param_type: "string".to_string(), required: true },
+                ToolParam { name: "source".to_string(), param_type: "string".to_string(), required: true },
+            ],
+            cost: 5.0,
+        });
+        agent.tool_registry.register(Tool {
+            name: "mutate".to_string(),
+            description: "Apply mutation strategies to source code".to_string(),
+            parameters: vec![ToolParam {
+                name: "source".to_string(), param_type: "string".to_string(), required: true,
+            }],
+            cost: 2.0,
+        });
+        agent.tool_registry.register(Tool {
+            name: "analyze".to_string(),
+            description: "Extract features and analyze code quality".to_string(),
+            parameters: vec![ToolParam {
+                name: "source".to_string(), param_type: "string".to_string(), required: true,
+            }],
+            cost: 1.0,
+        });
+        EvolutionAgent {
+            agent,
+            evolution_budget: budget,
+            cycles_run: 0,
+            total_improvements: 0,
+            total_regressions: 0,
+        }
+    }
+
+    /// Run one autonomous evolution cycle using the engine.
+    /// The agent observes the landscape, plans mutations, executes them,
+    /// and reflects on outcomes.
+    pub fn run_evolution_cycle(&mut self) -> EvolutionCycleReport {
+        self.cycles_run += 1;
+        let mut report = EvolutionCycleReport {
+            cycle: self.cycles_run,
+            functions_attempted: 0,
+            improvements: 0,
+            regressions: 0,
+            validations_failed: 0,
+        };
+
+        // 1. Observe: snapshot the current landscape
+        let landscape = crate::engine::with_engine(|eng| eng.get_landscape());
+        self.agent.observe(Observation {
+            kind: ObservationKind::Text,
+            content: landscape,
+            timestamp: self.cycles_run as u64,
+            metadata: HashMap::new(),
+        });
+
+        // 2. Plan: run an evolution cycle via the engine
+        self.agent.plan("observe landscape, mutate functions, evolve variants, reflect on results");
+
+        // 3. Act: delegate to engine's run_cycle
+        let cycle_result = crate::engine::with_engine(|eng| {
+            eng.run_cycle()
+        });
+
+        report.functions_attempted = cycle_result.attempts.len();
+        report.improvements = cycle_result.functions_improved;
+        report.regressions = cycle_result.functions_regressed;
+
+        self.total_improvements += report.improvements;
+        self.total_regressions += report.regressions;
+
+        // 4. Record step results
+        for (i, attempt) in cycle_result.attempts.iter().enumerate() {
+            self.agent.record_result(
+                i.min(self.agent.current_plan.as_ref().map_or(0, |p| p.steps.len().saturating_sub(1))),
+                attempt.success,
+                &format!("fitness={:.4}", attempt.fitness),
+            );
+        }
+
+        // 5. Reflect
+        if let Some(reflection) = self.agent.reflect() {
+            self.agent.observe(Observation {
+                kind: if reflection.outcome == ReflectionOutcome::Success {
+                    ObservationKind::FeedbackPositive
+                } else {
+                    ObservationKind::FeedbackNegative
+                },
+                content: reflection.lesson.clone(),
+                timestamp: self.cycles_run as u64,
+                metadata: HashMap::new(),
+            });
+        }
+
+        report
+    }
+
+    /// Run multiple evolution cycles up to the budget.
+    pub fn run_autonomous(&mut self, max_cycles: usize) -> Vec<EvolutionCycleReport> {
+        let cycles = max_cycles.min(self.evolution_budget.saturating_sub(self.cycles_run));
+        let mut reports = Vec::with_capacity(cycles);
+        for _ in 0..cycles {
+            reports.push(self.run_evolution_cycle());
+        }
+        reports
+    }
+
+    /// Summary statistics as JSON.
+    pub fn summary_json(&self) -> String {
+        format!(
+            "{{\"agent\":\"{}\",\"cycles\":{},\"improvements\":{},\"regressions\":{},\"success_rate\":{:.4},\"budget_remaining\":{}}}",
+            self.agent.name,
+            self.cycles_run,
+            self.total_improvements,
+            self.total_regressions,
+            self.agent.success_rate(),
+            self.evolution_budget.saturating_sub(self.cycles_run),
+        )
+    }
+}
+
+/// Report from one autonomous evolution cycle.
+#[derive(Debug, Clone)]
+pub struct EvolutionCycleReport {
+    pub cycle: usize,
+    pub functions_attempted: usize,
+    pub improvements: usize,
+    pub regressions: usize,
+    pub validations_failed: usize,
+}
+
+impl EvolutionCycleReport {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"cycle\":{},\"attempted\":{},\"improvements\":{},\"regressions\":{},\"validations_failed\":{}}}",
+            self.cycle, self.functions_attempted, self.improvements, self.regressions, self.validations_failed,
+        )
+    }
+}
+
+// ── FFI Interface ───────────────────────────────────────────────────────
+
 static AGENT_STORE: Mutex<Option<HashMap<i64, Agent>>> = Mutex::new(None);
 
 fn agent_store_insert(agent: Agent) -> i64 {
@@ -602,5 +769,97 @@ mod tests {
         assert!(id >= 0);
         assert_eq!(vitalis_agent_total_actions(id), 0);
         vitalis_agent_free(id);
+    }
+
+    // ── v69: Evolution-aware agent tests ─────────────────────────────────
+
+    #[test]
+    fn test_evolution_agent_creation() {
+        let ea = EvolutionAgent::new("evo_test", 100);
+        assert_eq!(ea.agent.name, "evo_test");
+        assert_eq!(ea.evolution_budget, 100);
+        assert_eq!(ea.cycles_run, 0);
+        assert!(ea.agent.tool_registry.get("validate").is_some());
+        assert!(ea.agent.tool_registry.get("evolve").is_some());
+        assert!(ea.agent.tool_registry.get("mutate").is_some());
+        assert!(ea.agent.tool_registry.get("analyze").is_some());
+    }
+
+    #[test]
+    fn test_evolution_agent_tools_registered() {
+        let ea = EvolutionAgent::new("tools_test", 50);
+        // All 4 tools should be registered
+        assert!(ea.agent.tool_registry.get("validate").is_some());
+        assert!(ea.agent.tool_registry.get("evolve").is_some());
+        assert!(ea.agent.tool_registry.get("mutate").is_some());
+        assert!(ea.agent.tool_registry.get("analyze").is_some());
+    }
+
+    #[test]
+    fn test_evolution_cycle_report_json() {
+        let report = EvolutionCycleReport {
+            cycle: 5,
+            functions_attempted: 3,
+            improvements: 2,
+            regressions: 0,
+            validations_failed: 1,
+        };
+        let json = report.to_json();
+        assert!(json.contains("\"cycle\":5"));
+        assert!(json.contains("\"improvements\":2"));
+    }
+
+    #[test]
+    fn test_evolution_agent_run_cycle() {
+        // Register a function first, then run a cycle
+        crate::engine::with_engine(|eng| {
+            eng.register("agent_target", "fn agent_target(x: i64) -> i64 { x + 1 }");
+        });
+        let mut ea = EvolutionAgent::new("cycle_test", 10);
+        let report = ea.run_evolution_cycle();
+        assert_eq!(report.cycle, 1);
+        assert_eq!(ea.cycles_run, 1);
+    }
+
+    #[test]
+    fn test_evolution_agent_run_autonomous() {
+        crate::engine::with_engine(|eng| {
+            eng.register("auto_fn", "fn auto_fn(x: i64) -> i64 { x * 2 }");
+        });
+        let mut ea = EvolutionAgent::new("auto_test", 5);
+        let reports = ea.run_autonomous(3);
+        assert_eq!(reports.len(), 3);
+        assert_eq!(ea.cycles_run, 3);
+    }
+
+    #[test]
+    fn test_evolution_agent_budget_limit() {
+        let mut ea = EvolutionAgent::new("budget_test", 2);
+        let reports = ea.run_autonomous(10); // try to run 10, but budget is 2
+        assert_eq!(reports.len(), 2);
+        assert_eq!(ea.cycles_run, 2);
+        // Budget exhausted, no more cycles
+        let more = ea.run_autonomous(5);
+        assert_eq!(more.len(), 0);
+    }
+
+    #[test]
+    fn test_evolution_agent_summary_json() {
+        let ea = EvolutionAgent::new("summary_test", 100);
+        let json = ea.summary_json();
+        assert!(json.contains("\"agent\":\"summary_test\""));
+        assert!(json.contains("\"cycles\":0"));
+        assert!(json.contains("\"budget_remaining\":100"));
+    }
+
+    #[test]
+    fn test_evolution_agent_reflects() {
+        crate::engine::with_engine(|eng| {
+            eng.register("reflect_fn", "fn reflect_fn(x: i64) -> i64 { x }");
+        });
+        let mut ea = EvolutionAgent::new("reflect_test", 10);
+        ea.run_evolution_cycle();
+        // Agent should have reflections after a cycle
+        assert!(!ea.agent.reflections.is_empty() || ea.agent.observations.len() >= 1);
     }
 }

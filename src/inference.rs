@@ -3,7 +3,6 @@
 //! Provides efficient model inference with KV-cache, temperature/top-k/top-p sampling,
 //! beam search, repetition penalty, and speculative decoding for fast autoregressive generation.
 
-use std::sync::Mutex;
 use std::collections::HashMap;
 
 // ── Sampling Strategies ─────────────────────────────────────────────────

@@ -516,6 +516,99 @@ pub fn relu_kernel(workgroup_size: u32) -> ComputeKernel {
     kernel
 }
 
+// ── v114: FFI for .sl access ────────────────────────────────────────────
+
+use std::sync::Mutex;
+
+static GPU_PIPELINES: Mutex<Option<HashMap<i64, ComputePipeline>>> = Mutex::new(None);
+
+fn gpu_store() -> std::sync::MutexGuard<'static, Option<HashMap<i64, ComputePipeline>>> {
+    GPU_PIPELINES.lock().unwrap()
+}
+
+fn next_gpu_id() -> i64 {
+    static CTR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+    CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Create a new compute pipeline, return its handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_gpu_pipeline_new() -> i64 {
+    let id = next_gpu_id();
+    let pipeline = ComputePipeline::new("sl_pipeline");
+    let mut store = gpu_store();
+    store.get_or_insert_with(HashMap::new).insert(id, pipeline);
+    id
+}
+
+/// Add a predefined kernel to a pipeline. kernel_type: 0=vector_add, 1=matmul, 2=relu.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_gpu_add_kernel(pipeline_id: i64, kernel_type: i64, size: i64) -> i64 {
+    let mut store = gpu_store();
+    if let Some(pipe) = store.as_mut().and_then(|s| s.get_mut(&pipeline_id)) {
+        let kernel = match kernel_type {
+            0 => vector_add_kernel(size as u32),
+            1 => matmul_kernel(size as u32, size as u32, size as u32),
+            2 => relu_kernel(size as u32),
+            _ => return -1,
+        };
+        pipe.add_kernel(kernel);
+        0
+    } else {
+        -1
+    }
+}
+
+/// Create a buffer in the pipeline. Returns buffer ID.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_gpu_create_buffer(pipeline_id: i64, count: i64) -> i64 {
+    let mut store = gpu_store();
+    if let Some(pipe) = store.as_mut().and_then(|s| s.get_mut(&pipeline_id)) {
+        pipe.create_buffer(BufferElementType::F32, count as usize, BufferUsage::Storage) as i64
+    } else {
+        -1
+    }
+}
+
+/// Execute the pipeline on software backend. Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_gpu_dispatch(pipeline_id: i64) -> i64 {
+    let mut store = gpu_store();
+    if let Some(pipe) = store.as_mut().and_then(|s| s.get_mut(&pipeline_id)) {
+        match pipe.execute_software() {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    } else {
+        -1
+    }
+}
+
+/// Get buffer count in a pipeline.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_gpu_buffer_count(pipeline_id: i64) -> i64 {
+    let store = gpu_store();
+    store.as_ref().and_then(|s| s.get(&pipeline_id))
+        .map(|p| p.buffer_count() as i64)
+        .unwrap_or(-1)
+}
+
+/// Get kernel count in a pipeline.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_gpu_kernel_count(pipeline_id: i64) -> i64 {
+    let store = gpu_store();
+    store.as_ref().and_then(|s| s.get(&pipeline_id))
+        .map(|p| p.kernel_count() as i64)
+        .unwrap_or(-1)
+}
+
+/// Free a pipeline.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_gpu_pipeline_free(pipeline_id: i64) {
+    let mut store = gpu_store();
+    if let Some(s) = store.as_mut() { s.remove(&pipeline_id); }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -743,5 +836,96 @@ mod tests {
             max_shared_memory: 49152,
         };
         assert_eq!(dev.memory_mb(), 8192);
+    }
+
+    // ── v114: FFI integration tests ─────────────────────────────────────
+
+    #[test]
+    fn test_v114_ffi_pipeline_lifecycle() {
+        let id = vitalis_gpu_pipeline_new();
+        assert!(id > 0);
+        let kc = vitalis_gpu_kernel_count(id);
+        assert_eq!(kc, 0);
+        let bc = vitalis_gpu_buffer_count(id);
+        assert_eq!(bc, 0);
+        vitalis_gpu_pipeline_free(id);
+    }
+
+    #[test]
+    fn test_v114_ffi_add_kernel() {
+        let id = vitalis_gpu_pipeline_new();
+        // Add vector_add kernel (type 0)
+        let r = vitalis_gpu_add_kernel(id, 0, 64);
+        assert_eq!(r, 0);
+        assert_eq!(vitalis_gpu_kernel_count(id), 1);
+        // Add relu kernel (type 2)
+        let r2 = vitalis_gpu_add_kernel(id, 2, 128);
+        assert_eq!(r2, 0);
+        assert_eq!(vitalis_gpu_kernel_count(id), 2);
+        vitalis_gpu_pipeline_free(id);
+    }
+
+    #[test]
+    fn test_v114_ffi_create_buffer() {
+        let id = vitalis_gpu_pipeline_new();
+        let buf0 = vitalis_gpu_create_buffer(id, 100);
+        assert_eq!(buf0, 0); // first buffer gets ID 0
+        let buf1 = vitalis_gpu_create_buffer(id, 200);
+        assert_eq!(buf1, 1);
+        assert_eq!(vitalis_gpu_buffer_count(id), 2);
+        vitalis_gpu_pipeline_free(id);
+    }
+
+    #[test]
+    fn test_v114_ffi_dispatch_empty() {
+        let id = vitalis_gpu_pipeline_new();
+        // Dispatch with no stages → success (nothing to do)
+        let r = vitalis_gpu_dispatch(id);
+        assert_eq!(r, 0);
+        vitalis_gpu_pipeline_free(id);
+    }
+
+    #[test]
+    fn test_v114_ffi_invalid_kernel_type() {
+        let id = vitalis_gpu_pipeline_new();
+        let r = vitalis_gpu_add_kernel(id, 99, 64); // invalid type
+        assert_eq!(r, -1);
+        vitalis_gpu_pipeline_free(id);
+    }
+
+    #[test]
+    fn test_v114_ffi_invalid_pipeline() {
+        assert_eq!(vitalis_gpu_kernel_count(9999), -1);
+        assert_eq!(vitalis_gpu_buffer_count(9999), -1);
+        assert_eq!(vitalis_gpu_dispatch(9999), -1);
+    }
+
+    #[test]
+    fn test_v114_jit_gpu_pipeline() {
+        let source = r#"
+fn main() -> i64 {
+    let pipe: i64 = gpu_pipeline_new();
+    let kc: i64 = gpu_kernel_count(pipe);
+    gpu_pipeline_free(pipe);
+    kc
+}
+"#;
+        let result = crate::codegen::compile_and_run(source).unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_v114_jit_gpu_add_kernel_and_buffer() {
+        // Simpler: just check kernel count after adding one kernel
+        let source = r#"
+fn main() -> i64 {
+    let pipe: i64 = gpu_pipeline_new();
+    gpu_add_kernel(pipe, 0, 64);
+    let kc: i64 = gpu_kernel_count(pipe);
+    kc
+}
+"#;
+        let result = crate::codegen::compile_and_run(source).unwrap();
+        assert_eq!(result, 1);
     }
 }

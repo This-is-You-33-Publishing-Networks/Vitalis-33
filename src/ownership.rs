@@ -142,6 +142,71 @@ impl BorrowChecker {
         }
     }
 
+    /// Mark a variable as borrowed (shared or mutable) and update borrow counts.
+    fn mark_borrowed(&mut self, name: &str, mutable: bool) {
+        if let Some(info) = self.lookup_mut(name) {
+            match info.state {
+                OwnershipState::Moved => {
+                    self.errors.push(OwnershipError {
+                        message: format!("cannot borrow '{}' — value has been moved", name),
+                        variable: name.to_string(),
+                        state: OwnershipState::Moved,
+                    });
+                    return;
+                }
+                OwnershipState::Dropped => {
+                    self.errors.push(OwnershipError {
+                        message: format!("cannot borrow '{}' — value has been dropped", name),
+                        variable: name.to_string(),
+                        state: OwnershipState::Dropped,
+                    });
+                    return;
+                }
+                OwnershipState::BorrowedMut if mutable => {
+                    self.errors.push(OwnershipError {
+                        message: format!("cannot mutably borrow '{}' — already mutably borrowed", name),
+                        variable: name.to_string(),
+                        state: OwnershipState::BorrowedMut,
+                    });
+                    return;
+                }
+                OwnershipState::BorrowedMut if !mutable => {
+                    self.errors.push(OwnershipError {
+                        message: format!("cannot borrow '{}' as immutable — already mutably borrowed", name),
+                        variable: name.to_string(),
+                        state: OwnershipState::BorrowedMut,
+                    });
+                    return;
+                }
+                OwnershipState::BorrowedShared if mutable => {
+                    self.errors.push(OwnershipError {
+                        message: format!("cannot mutably borrow '{}' — already immutably borrowed", name),
+                        variable: name.to_string(),
+                        state: OwnershipState::BorrowedShared,
+                    });
+                    return;
+                }
+                _ => {}
+            }
+            if mutable {
+                info.state = OwnershipState::BorrowedMut;
+                info.mut_borrow_count += 1;
+            } else {
+                info.state = OwnershipState::BorrowedShared;
+                info.borrow_count += 1;
+            }
+        }
+    }
+
+    /// Release borrows — return variable to Owned state.
+    fn release_borrow(&mut self, name: &str) {
+        if let Some(info) = self.lookup_mut(name) {
+            if info.state == OwnershipState::BorrowedShared || info.state == OwnershipState::BorrowedMut {
+                info.state = OwnershipState::Owned;
+            }
+        }
+    }
+
     fn check_function(&mut self, func: &Function) {
         self.push_scope();
         // Declare params as owned
@@ -205,13 +270,9 @@ impl BorrowChecker {
             }
             Expr::Call { func, args, .. } => {
                 self.check_expr(func);
-                // When passing to a function, values are moved by default
                 for arg in args {
                     if let Expr::Ident(name, _) = arg {
                         self.check_use(name);
-                        // In a move-semantics language, calling f(x) moves x
-                        // For now we only move if arg is a sole ident
-                        // (keep conservative — don't move primitives)
                     } else {
                         self.check_expr(arg);
                     }
@@ -251,10 +312,87 @@ impl BorrowChecker {
                     self.check_expr(el);
                 }
             }
-            Expr::Lambda { body, .. } => {
+            Expr::Lambda { params, body, .. } => {
+                self.push_scope();
+                for p in params {
+                    self.declare(&p.name, false);
+                }
                 self.check_expr(body);
+                self.pop_scope();
             }
-            _ => {} // Literals, etc. — no ownership implications
+            Expr::Assign { target, value, .. } => {
+                self.check_expr(value);
+                // Assignment to identifier — check target is mutable
+                if let Expr::Ident(name, _) = target.as_ref() {
+                    if let Some(info) = self.lookup(name) {
+                        if !info.mutable {
+                            self.errors.push(OwnershipError {
+                                message: format!("cannot assign to immutable variable '{}'", name),
+                                variable: name.to_string(),
+                                state: info.state,
+                            });
+                        }
+                    }
+                }
+                self.check_expr(target);
+            }
+            Expr::CompoundAssign { target, value, .. } => {
+                self.check_expr(value);
+                if let Expr::Ident(name, _) = target.as_ref() {
+                    if let Some(info) = self.lookup(name) {
+                        if !info.mutable {
+                            self.errors.push(OwnershipError {
+                                message: format!("cannot assign to immutable variable '{}'", name),
+                                variable: name.to_string(),
+                                state: info.state,
+                            });
+                        }
+                    }
+                }
+                self.check_expr(target);
+            }
+            Expr::Return { value, .. } => {
+                if let Some(val) = value {
+                    self.check_expr(val);
+                }
+            }
+            Expr::Pipe { stages, .. } => {
+                for stage in stages {
+                    self.check_expr(stage);
+                }
+            }
+            Expr::Try { expr, .. } => {
+                self.check_expr(expr);
+            }
+            Expr::TryCatch { try_body, catch_body, catch_var, .. } => {
+                self.check_block(try_body);
+                self.push_scope();
+                self.declare(catch_var, false);
+                self.check_block(catch_body);
+                self.pop_scope();
+            }
+            Expr::Throw { code, message, .. } => {
+                self.check_expr(code);
+                self.check_expr(message);
+            }
+            Expr::Range { start, end, .. } => {
+                self.check_expr(start);
+                self.check_expr(end);
+            }
+            Expr::Cast { expr, .. } => {
+                self.check_expr(expr);
+            }
+            Expr::StructLiteral { fields, .. } => {
+                for (_, val) in fields {
+                    self.check_expr(val);
+                }
+            }
+            Expr::Parallel { exprs, .. } => {
+                for e in exprs {
+                    self.check_expr(e);
+                }
+            }
+            _ => {} // Literals, break, continue — no ownership implications
         }
     }
 }
@@ -271,6 +409,41 @@ pub fn analyze_ownership(source: &str) -> Vec<OwnershipError> {
     }
     let mut checker = BorrowChecker::new();
     checker.check(&program)
+}
+
+/// Run combined ownership + NLL analysis on source code.
+/// Returns ownership errors first, then NLL errors mapped to OwnershipError.
+pub fn analyze_full_safety(source: &str) -> Vec<OwnershipError> {
+    let (program, errors) = crate::parser::parse(source);
+    if !errors.is_empty() {
+        return vec![OwnershipError {
+            message: "Cannot analyze safety — parse errors present".to_string(),
+            variable: String::new(),
+            state: OwnershipState::Undefined,
+        }];
+    }
+
+    // Phase 1: Ownership/move analysis
+    let mut checker = BorrowChecker::new();
+    let mut all_errors = checker.check(&program);
+
+    // Phase 2: NLL borrow region analysis
+    let nll_errors = crate::nll::analyze_nll(source);
+    for nll_err in nll_errors {
+        all_errors.push(OwnershipError {
+            message: nll_err.message,
+            variable: String::new(),
+            state: match nll_err.kind {
+                crate::nll::NllErrorKind::MutableAliasing => OwnershipState::BorrowedMut,
+                crate::nll::NllErrorKind::MutableSharedConflict => OwnershipState::BorrowedShared,
+                crate::nll::NllErrorKind::UseAfterMove => OwnershipState::Moved,
+                crate::nll::NllErrorKind::BorrowAfterMove => OwnershipState::Moved,
+                crate::nll::NllErrorKind::ModifyWhileBorrowed => OwnershipState::BorrowedMut,
+            },
+        });
+    }
+
+    all_errors
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -417,5 +590,127 @@ mod tests {
         assert_ne!(OwnershipState::Owned, OwnershipState::Moved);
         assert_ne!(OwnershipState::BorrowedShared, OwnershipState::BorrowedMut);
         assert_ne!(OwnershipState::Dropped, OwnershipState::Undefined);
+    }
+
+    // ─── v130 tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_v130_borrow_tracking_shared() {
+        let mut checker = BorrowChecker::new();
+        checker.declare("x", false);
+        checker.mark_borrowed("x", false);
+        let info = checker.lookup("x").unwrap();
+        assert_eq!(info.state, OwnershipState::BorrowedShared);
+        assert_eq!(info.borrow_count, 1);
+    }
+
+    #[test]
+    fn test_v130_borrow_tracking_mut() {
+        let mut checker = BorrowChecker::new();
+        checker.declare("x", true);
+        checker.mark_borrowed("x", true);
+        let info = checker.lookup("x").unwrap();
+        assert_eq!(info.state, OwnershipState::BorrowedMut);
+        assert_eq!(info.mut_borrow_count, 1);
+    }
+
+    #[test]
+    fn test_v130_double_mut_borrow_error() {
+        let mut checker = BorrowChecker::new();
+        checker.declare("x", true);
+        checker.mark_borrowed("x", true);
+        checker.mark_borrowed("x", true); // should error
+        assert_eq!(checker.errors.len(), 1);
+        assert!(checker.errors[0].message.contains("already mutably borrowed"));
+    }
+
+    #[test]
+    fn test_v130_shared_then_mut_borrow_error() {
+        let mut checker = BorrowChecker::new();
+        checker.declare("x", true);
+        checker.mark_borrowed("x", false); // shared
+        checker.mark_borrowed("x", true);  // mut — should error
+        assert_eq!(checker.errors.len(), 1);
+        assert!(checker.errors[0].message.contains("already immutably borrowed"));
+    }
+
+    #[test]
+    fn test_v130_mut_then_shared_borrow_error() {
+        let mut checker = BorrowChecker::new();
+        checker.declare("x", true);
+        checker.mark_borrowed("x", true);  // mut
+        checker.mark_borrowed("x", false); // shared — should error
+        assert_eq!(checker.errors.len(), 1);
+        assert!(checker.errors[0].message.contains("already mutably borrowed"));
+    }
+
+    #[test]
+    fn test_v130_borrow_moved_value_error() {
+        let mut checker = BorrowChecker::new();
+        checker.declare("x", false);
+        checker.mark_moved("x");
+        checker.mark_borrowed("x", false); // borrow of moved value — error
+        assert_eq!(checker.errors.len(), 1);
+        assert!(checker.errors[0].message.contains("moved"));
+    }
+
+    #[test]
+    fn test_v130_release_borrow() {
+        let mut checker = BorrowChecker::new();
+        checker.declare("x", true);
+        checker.mark_borrowed("x", true);
+        checker.release_borrow("x");
+        let info = checker.lookup("x").unwrap();
+        assert_eq!(info.state, OwnershipState::Owned);
+    }
+
+    #[test]
+    fn test_v130_immutable_assignment_error() {
+        let errors = analyze_ownership("fn main() -> i64 { let x = 42; x = 10; x }");
+        assert!(!errors.is_empty(), "Should detect assignment to immutable var");
+        assert!(errors.iter().any(|e| e.message.contains("immutable")));
+    }
+
+    #[test]
+    fn test_v130_mutable_assignment_ok() {
+        let errors = analyze_ownership("fn main() -> i64 { let mut x = 42; x = 10; x }");
+        assert!(errors.is_empty(), "Mutable assignment should be ok: {:?}", errors);
+    }
+
+    #[test]
+    fn test_v130_pipe_chain_ownership() {
+        let errors = analyze_ownership("fn inc(x: i64) -> i64 { x + 1 }\nfn main() -> i64 { 10 |> inc |> inc }");
+        assert!(errors.is_empty(), "Pipe chains should work: {:?}", errors);
+    }
+
+    #[test]
+    fn test_v130_try_catch_ownership() {
+        let errors = analyze_ownership("fn main() -> i64 { try { 42 } catch e { 0 } }");
+        assert!(errors.is_empty(), "Try/catch should work: {:?}", errors);
+    }
+
+    #[test]
+    fn test_v130_lambda_param_declaration() {
+        let errors = analyze_ownership("fn main() -> i64 { let f = |a: i64, b: i64| -> i64 { a + b }; f(1, 2) }");
+        assert!(errors.is_empty(), "Lambda params should be declared: {:?}", errors);
+    }
+
+    #[test]
+    fn test_v130_full_safety_clean() {
+        let errors = analyze_full_safety("fn main() -> i64 { let x = 42; x }");
+        assert!(errors.is_empty(), "Full safety should pass for clean program: {:?}", errors);
+    }
+
+    #[test]
+    fn test_v130_full_safety_parse_error() {
+        let errors = analyze_full_safety("fn { broken");
+        assert!(!errors.is_empty());
+        assert!(errors[0].message.contains("parse errors"));
+    }
+
+    #[test]
+    fn test_v130_struct_literal_ownership() {
+        let errors = analyze_ownership("struct Point { x: i64, y: i64 }\nfn main() -> i64 { let p = Point { x: 1, y: 2 }; p.x }");
+        assert!(errors.is_empty(), "Struct literals should work: {:?}", errors);
     }
 }

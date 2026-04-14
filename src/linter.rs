@@ -1020,8 +1020,7 @@ mod tests {
     fn test_lint_for_loop_var() {
         let diags = lint("fn main() -> i64 { let mut s: i64 = 0; for i in 0..1 { s = s + i; } s }");
         // Variable i is used inside the loop
-        // (we only care it doesn't crash)
-        assert!(diags.len() >= 0);
+        assert!(diags.iter().all(|d| !d.message.trim().is_empty()));
     }
 
     #[test]
@@ -1036,7 +1035,7 @@ mod tests {
     #[test]
     fn test_lint_return_expr() {
         let diags = lint("fn main() -> i64 { return 1 }");
-        assert!(diags.len() >= 0);
+        assert!(diags.iter().all(|d| !d.message.trim().is_empty()));
     }
 
     #[test]
@@ -1057,14 +1056,13 @@ mod tests {
     #[test]
     fn test_lint_nested_if() {
         let diags = lint("fn main() -> i64 { if true { if false { 1 } else { 2 } } else { 0 } }");
-        // Should lint without crashing
-        assert!(diags.len() >= 0);
+        assert!(diags.iter().all(|d| !d.message.trim().is_empty()));
     }
 
     #[test]
     fn test_lint_match_arms() {
         let diags = lint("fn main() -> i64 { match 1 { 0 => 0, 1 => 1, _ => 2 } }");
-        assert!(diags.len() >= 0);
+        assert!(diags.iter().all(|d| !d.message.trim().is_empty()));
     }
 
     #[test]
@@ -1078,6 +1076,6 @@ mod tests {
     #[test]
     fn test_lint_try_catch() {
         let diags = lint("fn main() -> i64 { try { 1 } catch e { 0 } }");
-        assert!(diags.len() >= 0);
+        assert!(diags.iter().all(|d| !d.message.trim().is_empty()));
     }
 }

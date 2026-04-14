@@ -481,7 +481,7 @@ impl HermeticBuild {
         data.extend(self.toolchain_version.as_bytes());
         data.extend(self.target_triple.as_bytes());
         let mut sorted_vars: Vec<_> = self.env_vars.iter().collect();
-        sorted_vars.sort_by_key(|(k, _)| k.clone());
+        sorted_vars.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
         for (k, v) in sorted_vars {
             data.extend(k.as_bytes());
             data.extend(v.as_bytes());

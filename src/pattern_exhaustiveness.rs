@@ -23,7 +23,7 @@
 //!
 //! Based on "Warnings for pattern matching" by Luc Maranget (JFP 2007).
 
-use std::collections::{HashMap, HashSet, BTreeSet};
+use std::collections::HashSet;
 use std::fmt;
 
 // ═══════════════════════════════════════════════════════════════════════

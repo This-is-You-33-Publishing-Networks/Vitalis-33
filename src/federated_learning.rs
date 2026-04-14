@@ -864,7 +864,7 @@ mod tests {
 
     #[test]
     fn test_fed_server_basic() {
-        let mut server = FedServer::new(10, AggregationMethod::FedAvg, 42);
+        let server = FedServer::new(10, AggregationMethod::FedAvg, 42);
         assert_eq!(server.round, 0);
         assert_eq!(server.global_weights.len(), 10);
     }

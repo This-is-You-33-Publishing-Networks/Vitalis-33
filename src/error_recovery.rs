@@ -6,7 +6,6 @@
 //! - **Edit distance suggestions**: Did-you-mean for identifiers
 //! - **Error budget**: Limit total errors reported per compilation
 
-use std::collections::HashMap;
 
 // ── Edit Distance ───────────────────────────────────────────────────
 

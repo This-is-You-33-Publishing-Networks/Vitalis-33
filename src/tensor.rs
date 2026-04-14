@@ -627,7 +627,7 @@ impl Tensor {
         new_shape[axis] = end - start;
         let numel: usize = new_shape.iter().product();
         let mut data = vec![0.0; numel];
-        let new_strides = compute_strides(&new_shape);
+        let _new_strides = compute_strides(&new_shape);
         let ndim = self.ndim();
 
         let mut indices = vec![0usize; ndim];
@@ -916,8 +916,8 @@ pub extern "C" fn vitalis_tensor_from_data(data_ptr: *const f64, count: i64, ndi
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_add(a: i64, b: i64) -> i64 {
     with_store(|s| {
-        let ta = s.get(&a).expect("tensor not found").clone();
-        let tb = s.get(&b).expect("tensor not found");
+        let ta = match s.get(&a) { Some(t) => t.clone(), None => return -1 };
+        let tb = match s.get(&b) { Some(t) => t, None => return -1 };
         let result = ta.add(tb);
         let id = next_id();
         s.insert(id, result);
@@ -928,8 +928,8 @@ pub extern "C" fn vitalis_tensor_add(a: i64, b: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_mul(a: i64, b: i64) -> i64 {
     with_store(|s| {
-        let ta = s.get(&a).expect("tensor not found").clone();
-        let tb = s.get(&b).expect("tensor not found");
+        let ta = match s.get(&a) { Some(t) => t.clone(), None => return -1 };
+        let tb = match s.get(&b) { Some(t) => t, None => return -1 };
         let result = ta.mul(tb);
         let id = next_id();
         s.insert(id, result);
@@ -940,8 +940,8 @@ pub extern "C" fn vitalis_tensor_mul(a: i64, b: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_matmul(a: i64, b: i64) -> i64 {
     with_store(|s| {
-        let ta = s.get(&a).expect("tensor not found").clone();
-        let tb = s.get(&b).expect("tensor not found");
+        let ta = match s.get(&a) { Some(t) => t.clone(), None => return -1 };
+        let tb = match s.get(&b) { Some(t) => t, None => return -1 };
         let result = ta.matmul(tb);
         let id = next_id();
         s.insert(id, result);
@@ -951,12 +951,12 @@ pub extern "C" fn vitalis_tensor_matmul(a: i64, b: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_sum(id: i64) -> f64 {
-    with_store(|s| s.get(&id).expect("tensor not found").sum())
+    with_store(|s| s.get(&id).map(|t| t.sum()).unwrap_or(0.0))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_mean(id: i64) -> f64 {
-    with_store(|s| s.get(&id).expect("tensor not found").mean())
+    with_store(|s| s.get(&id).map(|t| t.mean()).unwrap_or(0.0))
 }
 
 #[unsafe(no_mangle)]
@@ -964,7 +964,7 @@ pub extern "C" fn vitalis_tensor_reshape(id: i64, ndim: i64, shape_ptr: *const i
     let shape = unsafe { std::slice::from_raw_parts(shape_ptr, ndim as usize) };
     let shape_usize: Vec<usize> = shape.iter().map(|&s| s as usize).collect();
     with_store(|s| {
-        let t = s.get(&id).expect("tensor not found").reshape(&shape_usize);
+        let t = match s.get(&id) { Some(t) => t.reshape(&shape_usize), None => return -1 };
         let new_id = next_id();
         s.insert(new_id, t);
         new_id
@@ -974,7 +974,7 @@ pub extern "C" fn vitalis_tensor_reshape(id: i64, ndim: i64, shape_ptr: *const i
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_transpose(id: i64) -> i64 {
     with_store(|s| {
-        let t = s.get(&id).expect("tensor not found").transpose();
+        let t = match s.get(&id) { Some(t) => t.transpose(), None => return -1 };
         let new_id = next_id();
         s.insert(new_id, t);
         new_id
@@ -984,7 +984,7 @@ pub extern "C" fn vitalis_tensor_transpose(id: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_relu(id: i64) -> i64 {
     with_store(|s| {
-        let t = s.get(&id).expect("tensor not found").relu();
+        let t = match s.get(&id) { Some(t) => t.relu(), None => return -1 };
         let new_id = next_id();
         s.insert(new_id, t);
         new_id
@@ -994,7 +994,7 @@ pub extern "C" fn vitalis_tensor_relu(id: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_softmax(id: i64) -> i64 {
     with_store(|s| {
-        let t = s.get(&id).expect("tensor not found").softmax();
+        let t = match s.get(&id) { Some(t) => t.softmax(), None => return -1 };
         let new_id = next_id();
         s.insert(new_id, t);
         new_id
@@ -1003,22 +1003,76 @@ pub extern "C" fn vitalis_tensor_softmax(id: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_numel(id: i64) -> i64 {
-    with_store(|s| s.get(&id).expect("tensor not found").numel() as i64)
+    with_store(|s| s.get(&id).map(|t| t.numel() as i64).unwrap_or(0))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_ndim(id: i64) -> i64 {
-    with_store(|s| s.get(&id).expect("tensor not found").ndim() as i64)
+    with_store(|s| s.get(&id).map(|t| t.ndim() as i64).unwrap_or(0))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_get(id: i64, flat_idx: i64) -> f64 {
-    with_store(|s| s.get(&id).expect("tensor not found").get_flat(flat_idx as usize))
+    with_store(|s| s.get(&id).map(|t| t.get_flat(flat_idx as usize)).unwrap_or(0.0))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_tensor_free(id: i64) {
     with_store(|s| { s.remove(&id); });
+}
+
+// ── v115: Simplified tensor creation (no pointer args needed from .sl) ──
+
+/// Create a 2D zero tensor: tensor_zeros_2d(rows, cols) -> handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_tensor_zeros_2d(rows: i64, cols: i64) -> i64 {
+    let t = Tensor::zeros(&[rows as usize, cols as usize]);
+    let id = next_id();
+    with_store(|s| { s.insert(id, t); });
+    id
+}
+
+/// Create a 2D ones tensor: tensor_ones_2d(rows, cols) -> handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_tensor_ones_2d(rows: i64, cols: i64) -> i64 {
+    let t = Tensor::ones(&[rows as usize, cols as usize]);
+    let id = next_id();
+    with_store(|s| { s.insert(id, t); });
+    id
+}
+
+/// Create a 1D zero tensor: tensor_zeros_1d(len) -> handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_tensor_zeros_1d(len: i64) -> i64 {
+    let t = Tensor::zeros(&[len as usize]);
+    let id = next_id();
+    with_store(|s| { s.insert(id, t); });
+    id
+}
+
+/// Create a scalar tensor: tensor_scalar(value_bits) -> handle.
+/// value_bits is the f64 reinterpreted as i64 (use to_f64/to_i64 for conversion).
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_tensor_scalar(value_bits: i64) -> i64 {
+    let val = f64::from_bits(value_bits as u64);
+    let t = Tensor::from_data(vec![val], &[1]);
+    let id = next_id();
+    with_store(|s| { s.insert(id, t); });
+    id
+}
+
+/// Set a single element in a tensor by flat index.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_tensor_set(id: i64, flat_idx: i64, value_bits: i64) {
+    let val = f64::from_bits(value_bits as u64);
+    with_store(|s| {
+        if let Some(t) = s.get_mut(&id) {
+            let idx = flat_idx as usize;
+            if idx < t.data.len() {
+                t.data[idx] = val;
+            }
+        }
+    });
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -1384,5 +1438,139 @@ mod tests {
         let t = Tensor::from_data(vec![0.0], &[1]);
         let r = t.tanh_act();
         assert!((r.data[0] - 0.0).abs() < 1e-10);
+    }
+
+    // ── v115: JIT integration tests ──────────────────────────────────
+
+    #[test]
+    fn test_v115_ffi_zeros_2d() {
+        let id = vitalis_tensor_zeros_2d(2, 3);
+        assert!(id > 0);
+        assert_eq!(vitalis_tensor_numel(id), 6);
+        assert_eq!(vitalis_tensor_ndim(id), 2);
+        vitalis_tensor_free(id);
+    }
+
+    #[test]
+    fn test_v115_ffi_ones_2d() {
+        let id = vitalis_tensor_ones_2d(3, 2);
+        assert_eq!(vitalis_tensor_numel(id), 6);
+        let val = vitalis_tensor_get(id, 0);
+        assert!((val - 1.0).abs() < 1e-10);
+        vitalis_tensor_free(id);
+    }
+
+    #[test]
+    fn test_v115_ffi_zeros_1d() {
+        let id = vitalis_tensor_zeros_1d(5);
+        assert_eq!(vitalis_tensor_numel(id), 5);
+        assert_eq!(vitalis_tensor_ndim(id), 1);
+        vitalis_tensor_free(id);
+    }
+
+    #[test]
+    fn test_v115_ffi_scalar() {
+        let val: f64 = 3.14;
+        let id = vitalis_tensor_scalar(val.to_bits() as i64);
+        assert_eq!(vitalis_tensor_numel(id), 1);
+        let got = vitalis_tensor_get(id, 0);
+        assert!((got - 3.14).abs() < 1e-10);
+        vitalis_tensor_free(id);
+    }
+
+    #[test]
+    fn test_v115_ffi_set_get() {
+        let id = vitalis_tensor_zeros_2d(2, 2);
+        let val: f64 = 42.0;
+        vitalis_tensor_set(id, 1, val.to_bits() as i64);
+        let got = vitalis_tensor_get(id, 1);
+        assert!((got - 42.0).abs() < 1e-10);
+        vitalis_tensor_free(id);
+    }
+
+    #[test]
+    fn test_v115_ffi_add_and_sum() {
+        let a = vitalis_tensor_ones_2d(2, 2);
+        let b = vitalis_tensor_ones_2d(2, 2);
+        let c = vitalis_tensor_add(a, b);
+        let s = vitalis_tensor_sum(c);
+        assert!((s - 8.0).abs() < 1e-10);
+        vitalis_tensor_free(a);
+        vitalis_tensor_free(b);
+        vitalis_tensor_free(c);
+    }
+
+    #[test]
+    fn test_v115_ffi_relu() {
+        let id = vitalis_tensor_zeros_2d(1, 4);
+        let neg: f64 = -5.0;
+        let pos: f64 = 3.0;
+        vitalis_tensor_set(id, 0, neg.to_bits() as i64);
+        vitalis_tensor_set(id, 1, pos.to_bits() as i64);
+        let r = vitalis_tensor_relu(id);
+        assert!((vitalis_tensor_get(r, 0)).abs() < 1e-10); // relu(-5) = 0
+        assert!((vitalis_tensor_get(r, 1) - 3.0).abs() < 1e-10);
+        vitalis_tensor_free(id);
+        vitalis_tensor_free(r);
+    }
+
+    #[test]
+    fn test_v115_jit_tensor_create_and_numel() {
+        let source = r#"
+fn main() -> i64 {
+    let t: i64 = tensor_zeros_2d(3, 4);
+    let n: i64 = tensor_numel(t);
+    tensor_free(t);
+    n
+}
+"#;
+        let result = crate::codegen::compile_and_run(source).unwrap();
+        assert_eq!(result, 12);
+    }
+
+    #[test]
+    fn test_v115_jit_tensor_ones_and_ndim() {
+        let source = r#"
+fn main() -> i64 {
+    let t: i64 = tensor_ones_2d(2, 5);
+    let d: i64 = tensor_ndim(t);
+    tensor_free(t);
+    d
+}
+"#;
+        let result = crate::codegen::compile_and_run(source).unwrap();
+        assert_eq!(result, 2);
+    }
+
+    #[test]
+    fn test_v115_jit_tensor_add() {
+        let source = r#"
+fn main() -> i64 {
+    let a: i64 = tensor_ones_2d(2, 2);
+    let b: i64 = tensor_ones_2d(2, 2);
+    let c: i64 = tensor_add(a, b);
+    let n: i64 = tensor_numel(c);
+    tensor_free(a);
+    tensor_free(b);
+    tensor_free(c);
+    n
+}
+"#;
+        let result = crate::codegen::compile_and_run(source).unwrap();
+        assert_eq!(result, 4);
+    }
+
+    #[test]
+    fn test_v115_jit_tensor_zeros_1d() {
+        let source = r#"
+fn main() -> i64 {
+    let t: i64 = tensor_zeros_1d(10);
+    let n: i64 = tensor_numel(t);
+    tensor_free(t);
+    n
+}
+"#;
+        let result = crate::codegen::compile_and_run(source).unwrap();
+        assert_eq!(result, 10);
     }
 }

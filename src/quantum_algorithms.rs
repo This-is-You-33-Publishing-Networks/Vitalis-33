@@ -830,7 +830,7 @@ pub unsafe extern "C" fn vitalis_simon(secret: u64, n: usize) -> u64 {
 /// Full Grover's search: find marked item in database of size 2^n.
 /// `target` is the marked item index. Returns found index.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn vitalis_grover_search(n: usize, target: usize, seed: u64) -> i64 {
+pub unsafe extern "C" fn vitalis_grover_search(n: usize, target: usize, _seed: u64) -> i64 {
     if n == 0 || n > 20 || target >= (1 << n) { return -1; }
     let size = 1 << n;
     let mut state = make_state(n);

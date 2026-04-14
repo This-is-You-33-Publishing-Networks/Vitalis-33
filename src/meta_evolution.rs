@@ -593,6 +593,260 @@ where
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+//  v67: PRNG-based Thompson Sampling + Strategy Archiving
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Xorshift64 PRNG for stochastic selection (same one used in evolution.rs).
+pub struct MetaRng {
+    state: u64,
+}
+
+impl MetaRng {
+    pub fn new(seed: u64) -> Self {
+        Self { state: if seed == 0 { 0xCAFEBABE } else { seed } }
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    pub fn next_f64(&mut self) -> f64 {
+        (self.next_u64() & 0x1FFFFFFFFFFFFF) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Sample from Beta(alpha, beta) using Jöhnk's algorithm.
+    /// Returns a value in [0, 1].
+    pub fn sample_beta(&mut self, alpha: f64, beta: f64) -> f64 {
+        if alpha <= 0.0 || beta <= 0.0 { return 0.5; }
+
+        // For alpha=1, beta=1 (uniform): just return random
+        if (alpha - 1.0).abs() < 1e-9 && (beta - 1.0).abs() < 1e-9 {
+            return self.next_f64();
+        }
+
+        // Gamma variate via Marsaglia-Tsang for alpha >= 1
+        let ga = self.sample_gamma(alpha);
+        let gb = self.sample_gamma(beta);
+        let sum = ga + gb;
+        if sum <= 0.0 { return 0.5; }
+        ga / sum
+    }
+
+    /// Sample from Gamma(shape, 1.0) using Marsaglia-Tsang method.
+    fn sample_gamma(&mut self, shape: f64) -> f64 {
+        if shape < 1.0 {
+            // Boost: Gamma(a) = Gamma(a+1) * U^(1/a)
+            let u = self.next_f64().max(1e-15);
+            return self.sample_gamma(shape + 1.0) * u.powf(1.0 / shape);
+        }
+
+        let d = shape - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+
+        loop {
+            // Generate normal via Box-Muller
+            let u1 = self.next_f64().max(1e-15);
+            let u2 = self.next_f64();
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+
+            let v = (1.0 + c * z).powi(3);
+            if v <= 0.0 { continue; }
+
+            let u = self.next_f64().max(1e-15);
+            let zz = z * z;
+
+            if u.ln() < 0.5 * zz + d * (1.0 - v + v.ln()) {
+                return d * v;
+            }
+        }
+    }
+}
+
+/// An archived strategy that was extinct but preserved for reference.
+#[derive(Debug, Clone)]
+pub struct ArchivedStrategy {
+    pub name: String,
+    pub generation: u64,
+    pub total_uses: u64,
+    pub successes: u64,
+    pub avg_improvement: f64,
+    pub params: StrategyParams,
+    pub extinction_cycle: u64,
+    pub extinction_reason: String,
+}
+
+impl MetaEvolutionEngine {
+    /// Select strategy using real PRNG-based Thompson sampling.
+    pub fn select_strategy_stochastic(&mut self, rng: &mut MetaRng) -> Option<String> {
+        if self.strategies.is_empty() { return None; }
+
+        let mut best_name = String::new();
+        let mut best_sample = f64::NEG_INFINITY;
+
+        for (name, strategy) in &self.strategies {
+            let sample = rng.sample_beta(strategy.thompson_alpha, strategy.thompson_beta);
+            if sample > best_sample {
+                best_sample = sample;
+                best_name = name.clone();
+            }
+        }
+
+        self.active_strategy = Some(best_name.clone());
+        Some(best_name)
+    }
+
+    /// Archive a strategy before extinction (preserves knowledge).
+    pub fn archive_strategy(&self, name: &str, cycle: u64, reason: &str) -> Option<ArchivedStrategy> {
+        self.strategies.get(name).map(|s| ArchivedStrategy {
+            name: s.name.clone(),
+            generation: s.generation,
+            total_uses: s.total_uses,
+            successes: s.successes,
+            avg_improvement: s.avg_improvement,
+            params: s.params.clone(),
+            extinction_cycle: cycle,
+            extinction_reason: reason.to_string(),
+        })
+    }
+
+    /// Run meta-evolution with real PRNG and archiving.
+    pub fn meta_evolve_with_rng(&mut self, rng: &mut MetaRng, archive: &mut Vec<ArchivedStrategy>) -> MetaCycleResult {
+        self.meta_cycles += 1;
+        let cycle = self.meta_cycles;
+
+        let mut bred = 0;
+        let mut mutated = 0;
+        let mut extinct = 0;
+
+        // 1. Rank strategies
+        let mut ranked: Vec<(String, f64)> = self.strategies.iter()
+            .filter(|(_, s)| s.total_uses >= 3)
+            .map(|(name, s)| {
+                let success_rate = s.successes as f64 / s.total_uses.max(1) as f64;
+                let score = success_rate * 0.5 + s.avg_improvement.max(0.0) / 10.0 * 0.5;
+                (name.clone(), score)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 2. Breed top strategies with stochastic parent selection
+        if ranked.len() >= 2 {
+            // Use rng to sometimes pick non-top parents (diversity)
+            let parent_a_idx = if rng.next_f64() < 0.7 { 0 } else { rng.next_u64() as usize % ranked.len() };
+            let mut parent_b_idx = if rng.next_f64() < 0.7 { 1 } else { rng.next_u64() as usize % ranked.len() };
+            if parent_b_idx == parent_a_idx { parent_b_idx = (parent_a_idx + 1) % ranked.len(); }
+
+            let parent_a = ranked[parent_a_idx].0.clone();
+            let parent_b = ranked[parent_b_idx].0.clone();
+
+            if let (Some(a), Some(b)) = (
+                self.strategies.get(&parent_a).cloned(),
+                self.strategies.get(&parent_b).cloned(),
+            ) {
+                let mut child_params = a.params.crossover(&b.params);
+                // Stochastic mutation on child
+                let mutation_intensity = rng.next_f64() * 0.3;
+                child_params = child_params.mutate(mutation_intensity);
+
+                let child_name = format!("hybrid_g{}_{}", cycle, self.breed_count);
+                let child = EvolutionStrategy {
+                    name: child_name.clone(),
+                    description: format!("Bred from {} × {} (rng)", parent_a, parent_b),
+                    params: child_params,
+                    total_uses: 0,
+                    successes: 0,
+                    avg_improvement: 0.0,
+                    best_improvement: 0.0,
+                    history: Vec::new(),
+                    thompson_alpha: 1.0,
+                    thompson_beta: 1.0,
+                    parent_strategies: vec![parent_a, parent_b],
+                    generation: a.generation.max(b.generation) + 1,
+                };
+                self.strategies.insert(child_name, child);
+                self.breed_count += 1;
+                bred += 1;
+            }
+        }
+
+        // 3. Mutate using PRNG intensity
+        if let Some((name, strategy)) = self.strategies.iter()
+            .filter(|(_, s)| s.total_uses >= 3)
+            .max_by(|a, b| a.1.total_uses.cmp(&b.1.total_uses))
+        {
+            let intensity = rng.next_f64() * 0.6 + 0.1;
+            let mutated_params = strategy.params.mutate(intensity);
+            let mutant_name = format!("mutant_g{}_{}", cycle, name);
+            let mutant = EvolutionStrategy {
+                name: mutant_name.clone(),
+                description: format!("Mutation of {} (intensity {:.2})", name, intensity),
+                params: mutated_params,
+                total_uses: 0,
+                successes: 0,
+                avg_improvement: 0.0,
+                best_improvement: 0.0,
+                history: Vec::new(),
+                thompson_alpha: 1.0,
+                thompson_beta: 1.0,
+                parent_strategies: vec![name.clone()],
+                generation: strategy.generation + 1,
+            };
+            self.strategies.insert(mutant_name, mutant);
+            mutated += 1;
+        }
+
+        // 4. Extinct poorly performing strategies — archive before removing
+        if self.strategies.len() > 5 {
+            let to_remove: Vec<String> = ranked.iter()
+                .rev()
+                .take_while(|(_, score)| *score < 0.1)
+                .map(|(name, _)| name.clone())
+                .filter(|n| n != "conservative" && n != "aggressive" && n != "balanced")
+                .take(self.strategies.len().saturating_sub(3))
+                .collect();
+
+            for name in &to_remove {
+                if let Some(archived) = self.archive_strategy(name, cycle, "low performance score") {
+                    archive.push(archived);
+                }
+                self.strategies.remove(name);
+                self.extinctions += 1;
+                extinct += 1;
+            }
+        }
+
+        MetaCycleResult {
+            meta_cycle: cycle,
+            strategies_bred: bred,
+            strategies_mutated: mutated,
+            strategies_extinct: extinct,
+            total_strategies: self.strategies.len(),
+            best_strategy: self.best_strategy_name.clone(),
+        }
+    }
+
+    /// Compute multi-objective score for a strategy.
+    pub fn multi_objective_score(strategy: &EvolutionStrategy) -> f64 {
+        if strategy.total_uses == 0 { return 0.0; }
+        let success_rate = strategy.successes as f64 / strategy.total_uses as f64;
+        let improvement = strategy.avg_improvement.max(0.0);
+        let consistency = if strategy.total_uses >= 10 {
+            // Variance of success: lower is more consistent
+            1.0 - (success_rate * (1.0 - success_rate)).sqrt()
+        } else {
+            0.5
+        };
+        // Combined score: 40% success, 30% improvement, 30% consistency
+        success_rate * 0.4 + (improvement / 10.0).min(1.0) * 0.3 + consistency * 0.3
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 //  TESTS
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -826,5 +1080,118 @@ mod tests {
 
         let strategy = engine.get_strategy("balanced").unwrap();
         assert!(strategy.history.len() <= 500, "History should be bounded");
+    }
+
+    // ─── v67: PRNG + Archiving Tests ──────────────────────────────────
+
+    #[test]
+    fn test_meta_rng_deterministic() {
+        let mut rng1 = MetaRng::new(42);
+        let mut rng2 = MetaRng::new(42);
+        for _ in 0..50 {
+            assert_eq!(rng1.next_u64(), rng2.next_u64());
+        }
+    }
+
+    #[test]
+    fn test_meta_rng_f64_range() {
+        let mut rng = MetaRng::new(123);
+        for _ in 0..100 {
+            let v = rng.next_f64();
+            assert!(v >= 0.0 && v < 1.0, "f64 out of range: {}", v);
+        }
+    }
+
+    #[test]
+    fn test_beta_sampling_range() {
+        let mut rng = MetaRng::new(999);
+        for _ in 0..100 {
+            let sample = rng.sample_beta(2.0, 5.0);
+            assert!(sample >= 0.0 && sample <= 1.0, "Beta sample out of range: {}", sample);
+        }
+    }
+
+    #[test]
+    fn test_beta_sampling_bias() {
+        // Beta(10, 2) should produce high values on average
+        let mut rng = MetaRng::new(77);
+        let mut sum = 0.0;
+        let n = 200;
+        for _ in 0..n {
+            sum += rng.sample_beta(10.0, 2.0);
+        }
+        let mean = sum / n as f64;
+        // Expected mean = alpha/(alpha+beta) = 10/12 ≈ 0.833
+        assert!(mean > 0.6, "Beta(10,2) mean too low: {}", mean);
+    }
+
+    #[test]
+    fn test_stochastic_select() {
+        let mut engine = MetaEvolutionEngine::new();
+        let mut rng = MetaRng::new(42);
+
+        // Make balanced strongly preferred
+        for i in 0..20 {
+            engine.record_result("balanced", "f", 50.0, 60.0, true, i);
+            engine.record_result("aggressive", "f", 50.0, 45.0, false, i);
+        }
+
+        let mut balanced_count = 0;
+        for _ in 0..50 {
+            let name = engine.select_strategy_stochastic(&mut rng).unwrap();
+            if name == "balanced" { balanced_count += 1; }
+        }
+        // Balanced should win most of the time
+        assert!(balanced_count > 25, "balanced only selected {} / 50 times", balanced_count);
+    }
+
+    #[test]
+    fn test_archive_strategy() {
+        let mut engine = MetaEvolutionEngine::new();
+        engine.record_result("conservative", "f", 50.0, 55.0, true, 1);
+
+        let archived = engine.archive_strategy("conservative", 10, "test extinction");
+        assert!(archived.is_some());
+        let archived = archived.unwrap();
+        assert_eq!(archived.name, "conservative");
+        assert_eq!(archived.extinction_cycle, 10);
+        assert_eq!(archived.total_uses, 1);
+    }
+
+    #[test]
+    fn test_meta_evolve_with_rng_and_archive() {
+        let mut engine = MetaEvolutionEngine::new();
+        let mut rng = MetaRng::new(42);
+        let mut archive: Vec<ArchivedStrategy> = Vec::new();
+
+        for i in 0..5 {
+            engine.record_result("balanced", "f", 50.0, 60.0, true, i);
+            engine.record_result("conservative", "f", 50.0, 55.0, true, i);
+            engine.record_result("aggressive", "f", 50.0, 45.0, false, i);
+        }
+
+        let result = engine.meta_evolve_with_rng(&mut rng, &mut archive);
+        assert!(result.strategies_bred > 0 || result.strategies_mutated > 0);
+        assert!(result.total_strategies >= 3);
+    }
+
+    #[test]
+    fn test_multi_objective_score() {
+        let strategy = EvolutionStrategy {
+            name: "test".to_string(),
+            description: String::new(),
+            params: StrategyParams::default_balanced(),
+            total_uses: 20,
+            successes: 16,  // 80% success rate
+            avg_improvement: 5.0,
+            best_improvement: 10.0,
+            history: Vec::new(),
+            thompson_alpha: 17.0,
+            thompson_beta: 5.0,
+            parent_strategies: Vec::new(),
+            generation: 0,
+        };
+        let score = MetaEvolutionEngine::multi_objective_score(&strategy);
+        assert!(score > 0.3, "multi-objective score too low: {}", score);
     }
 }

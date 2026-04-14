@@ -10,7 +10,7 @@
 //! - **Barrier**: Synchronization primitive
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // ── Task ────────────────────────────────────────────────────────────
 

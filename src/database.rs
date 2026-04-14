@@ -10,7 +10,6 @@
 //! - **Transactions**: BEGIN/COMMIT/ROLLBACK, serializable isolation via SSI
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::Instant;
 
 // ── Page & Buffer Pool ───────────────────────────────────────────────
 

@@ -355,6 +355,31 @@ pub unsafe extern "C" fn vitalis_xorshift128plus(
     s[1].wrapping_add(s0)
 }
 
+// ── v149: Public wrappers for codegen.rs builtins ─────────────────────
+
+/// SHA-256 hash of bytes, returned as 64-char hex string.
+pub fn sha256_public(data: &[u8]) -> String {
+    bytes_to_hex(&sha256_digest(data))
+}
+
+/// HMAC-SHA256 of key+message, returned as 64-char hex string.
+pub fn hmac_sha256_public(key: &[u8], message: &[u8]) -> String {
+    bytes_to_hex(&hmac_sha256(key, message))
+}
+
+/// Base64 encode bytes into a string.
+pub fn base64_encode_public(data: &[u8]) -> String {
+    base64_encode(data)
+}
+
+/// Base64 decode a string back to UTF-8 (lossy).
+pub fn base64_decode_public(encoded: &str) -> String {
+    match base64_decode(encoded) {
+        Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        None => String::new(),
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {

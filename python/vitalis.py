@@ -855,12 +855,27 @@ def hotpath_clip(values: list[float], min_val: float, max_val: float) -> list[fl
 
 # ── Phase 25: Numerical Linear Algebra & Loss Operations ────────────────
 
+# Set argtypes/restype at module level for Phase 25 hotpath functions
+_lib.hotpath_layer_norm.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.c_size_t, ctypes.c_double, ctypes.c_double, ctypes.c_double]
+_lib.hotpath_layer_norm.restype = ctypes.c_double
+
+_lib.hotpath_dropout_mask.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.c_size_t, ctypes.c_double, ctypes.c_uint64]
+_lib.hotpath_dropout_mask.restype = None
+
+_lib.hotpath_cosine_distance.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.c_size_t]
+_lib.hotpath_cosine_distance.restype = ctypes.c_double
+
+_lib.hotpath_huber_loss.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.c_size_t, ctypes.c_double]
+_lib.hotpath_huber_loss.restype = ctypes.c_double
+
+_lib.hotpath_mse_loss.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.c_size_t]
+_lib.hotpath_mse_loss.restype = ctypes.c_double
+
 def hotpath_layer_norm(values: list[float], gamma: float = 1.0, beta: float = 0.0, epsilon: float = 1e-5) -> tuple[list[float], float]:
     """Layer normalization: (x - mean) / sqrt(var + eps) * gamma + beta. Returns (normalized, mean). Native Rust."""
     if not values:
         return [], 0.0
     arr = (ctypes.c_double * len(values))(*values)
-    _lib.hotpath_layer_norm.restype = ctypes.c_double
     mean = _lib.hotpath_layer_norm(arr, len(values), ctypes.c_double(gamma), ctypes.c_double(beta), ctypes.c_double(epsilon))
     return list(arr), mean
 
@@ -881,7 +896,6 @@ def hotpath_cosine_distance(a: list[float], b: list[float]) -> float:
         return 1.0
     a_arr = (ctypes.c_double * n)(*a[:n])
     b_arr = (ctypes.c_double * n)(*b[:n])
-    _lib.hotpath_cosine_distance.restype = ctypes.c_double
     return _lib.hotpath_cosine_distance(a_arr, b_arr, n)
 
 
@@ -892,7 +906,6 @@ def hotpath_huber_loss(targets: list[float], predicted: list[float], delta: floa
         return 0.0
     t_arr = (ctypes.c_double * n)(*targets[:n])
     p_arr = (ctypes.c_double * n)(*predicted[:n])
-    _lib.hotpath_huber_loss.restype = ctypes.c_double
     return _lib.hotpath_huber_loss(t_arr, p_arr, n, ctypes.c_double(delta))
 
 
@@ -903,7 +916,6 @@ def hotpath_mse_loss(targets: list[float], predicted: list[float]) -> float:
         return 0.0
     t_arr = (ctypes.c_double * n)(*targets[:n])
     p_arr = (ctypes.c_double * n)(*predicted[:n])
-    _lib.hotpath_mse_loss.restype = ctypes.c_double
     return _lib.hotpath_mse_loss(t_arr, p_arr, n)
 
 
@@ -4699,6 +4711,325 @@ def evo_fitness_distance_correlation(solutions, fitness, dim, optimum):
 
 
 # ============================================================================
+# v123: Engine, Memory, and Meta-Evolution API
+# ============================================================================
+
+# ─── Engine API ──────────────────────────────────────────────────────────
+
+# i32 vitalis_engine_init()
+_lib.vitalis_engine_init.argtypes = []
+_lib.vitalis_engine_init.restype = ctypes.c_int32
+
+# i32 vitalis_engine_register(const char* name, const char* source)
+_lib.vitalis_engine_register.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+_lib.vitalis_engine_register.restype = ctypes.c_int32
+
+# char* vitalis_engine_evolve(const char* name, const char* new_source)
+_lib.vitalis_engine_evolve.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+_lib.vitalis_engine_evolve.restype = ctypes.c_void_p
+
+# char* vitalis_engine_validate(const char* source)
+_lib.vitalis_engine_validate.argtypes = [ctypes.c_char_p]
+_lib.vitalis_engine_validate.restype = ctypes.c_void_p
+
+# char* vitalis_engine_cycle()
+_lib.vitalis_engine_cycle.argtypes = []
+_lib.vitalis_engine_cycle.restype = ctypes.c_void_p
+
+# char* vitalis_engine_stats()
+_lib.vitalis_engine_stats.argtypes = []
+_lib.vitalis_engine_stats.restype = ctypes.c_void_p
+
+# char* vitalis_engine_landscape()
+_lib.vitalis_engine_landscape.argtypes = []
+_lib.vitalis_engine_landscape.restype = ctypes.c_void_p
+
+# char* vitalis_engine_population_summary()
+_lib.vitalis_engine_population_summary.argtypes = []
+_lib.vitalis_engine_population_summary.restype = ctypes.c_void_p
+
+# char* vitalis_engine_diagnostics()
+_lib.vitalis_engine_diagnostics.argtypes = []
+_lib.vitalis_engine_diagnostics.restype = ctypes.c_void_p
+
+# char* vitalis_engine_error_log(u64 limit)
+_lib.vitalis_engine_error_log.argtypes = [ctypes.c_uint64]
+_lib.vitalis_engine_error_log.restype = ctypes.c_void_p
+
+
+def engine_init() -> bool:
+    """Initialize the Vitalis evolution engine. Returns True on success."""
+    return _lib.vitalis_engine_init() == 1
+
+
+def engine_register(name: str, source: str) -> bool:
+    """Register a function for engine-managed evolution. Returns True on success."""
+    return _lib.vitalis_engine_register(name.encode("utf-8"), source.encode("utf-8")) == 1
+
+
+def engine_evolve(name: str, new_source: str) -> dict:
+    """Evolve a function with a new variant. Returns JSON result dict."""
+    ptr = _lib.vitalis_engine_evolve(name.encode("utf-8"), new_source.encode("utf-8"))
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"error": result}
+
+
+def engine_validate(source: str) -> dict:
+    """Validate Vitalis source code. Returns validation result dict."""
+    ptr = _lib.vitalis_engine_validate(source.encode("utf-8"))
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"error": result}
+
+
+def engine_cycle() -> dict:
+    """Run one full evolution cycle. Returns cycle result dict."""
+    ptr = _lib.vitalis_engine_cycle()
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"error": result}
+
+
+def engine_stats() -> dict:
+    """Get engine statistics as a dict."""
+    ptr = _lib.vitalis_engine_stats()
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"raw": result}
+
+
+def engine_landscape() -> dict:
+    """Get the fitness landscape (all functions + scores)."""
+    ptr = _lib.vitalis_engine_landscape()
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"raw": result}
+
+
+def engine_population_summary() -> dict:
+    """Get population-wide summary (diversity, fitness stats, total variants)."""
+    ptr = _lib.vitalis_engine_population_summary()
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"raw": result}
+
+
+def engine_diagnostics() -> dict:
+    """Get runtime diagnostics (OS/platform, compile latency, error log)."""
+    ptr = _lib.vitalis_engine_diagnostics()
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"raw": result}
+
+
+def engine_error_log(limit: int = 0) -> list:
+    """Get the last N error log entries (0 = all, up to 200)."""
+    ptr = _lib.vitalis_engine_error_log(limit)
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else []
+    except json.JSONDecodeError:
+        return []
+
+
+# ─── Memory (Engram) API ────────────────────────────────────────────────
+
+# u64 vitalis_memory_store(u32 kind, const char* content, const char* tags_json, f64 importance, const char* context, u64 cycle)
+_lib.vitalis_memory_store.argtypes = [ctypes.c_uint32, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_double, ctypes.c_char_p, ctypes.c_uint64]
+_lib.vitalis_memory_store.restype = ctypes.c_uint64
+
+# char* vitalis_memory_recall(const char* tag, u64 cycle)
+_lib.vitalis_memory_recall.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
+_lib.vitalis_memory_recall.restype = ctypes.c_void_p
+
+# i32 vitalis_memory_forget(u64 id)
+_lib.vitalis_memory_forget.argtypes = [ctypes.c_uint64]
+_lib.vitalis_memory_forget.restype = ctypes.c_int32
+
+# void vitalis_memory_decay(u64 cycle)
+_lib.vitalis_memory_decay.argtypes = [ctypes.c_uint64]
+_lib.vitalis_memory_decay.restype = None
+
+# char* vitalis_memory_consolidate(u64 cycle)
+_lib.vitalis_memory_consolidate.argtypes = [ctypes.c_uint64]
+_lib.vitalis_memory_consolidate.restype = ctypes.c_void_p
+
+# char* vitalis_memory_stats()
+_lib.vitalis_memory_stats.argtypes = []
+_lib.vitalis_memory_stats.restype = ctypes.c_void_p
+
+# u64 vitalis_memory_count()
+_lib.vitalis_memory_count.argtypes = []
+_lib.vitalis_memory_count.restype = ctypes.c_uint64
+
+
+ENGRAM_EPISODIC = 0
+ENGRAM_SEMANTIC = 1
+ENGRAM_PROCEDURAL = 2
+ENGRAM_WORKING = 3
+ENGRAM_EMOTIONAL = 4
+
+
+def memory_store(kind: int, content: str, tags: list[str], importance: float = 1.0, context: str = "", cycle: int = 0) -> int:
+    """Store a new engram. kind: 0=episodic, 1=semantic, 2=procedural, 3=working, 4=emotional. Returns engram ID."""
+    tags_json = json.dumps(tags)
+    return _lib.vitalis_memory_store(
+        kind, content.encode("utf-8"), tags_json.encode("utf-8"),
+        importance, context.encode("utf-8"), cycle,
+    )
+
+
+def memory_recall(tag: str, cycle: int = 0) -> list[dict]:
+    """Recall memories by tag. Returns list of engram dicts."""
+    ptr = _lib.vitalis_memory_recall(tag.encode("utf-8"), cycle)
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else []
+    except json.JSONDecodeError:
+        return []
+
+
+def memory_forget(engram_id: int) -> bool:
+    """Forget a specific memory by ID. Returns True on success."""
+    return _lib.vitalis_memory_forget(engram_id) == 1
+
+
+def memory_decay(cycle: int) -> None:
+    """Apply decay to all memories."""
+    _lib.vitalis_memory_decay(cycle)
+
+
+def memory_consolidate(cycle: int = 0) -> dict:
+    """Consolidate memories. Returns result dict."""
+    ptr = _lib.vitalis_memory_consolidate(cycle)
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"raw": result}
+
+
+def memory_stats() -> dict:
+    """Get memory statistics."""
+    ptr = _lib.vitalis_memory_stats()
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"raw": result}
+
+
+def memory_count() -> int:
+    """Get total active engram count."""
+    return _lib.vitalis_memory_count()
+
+
+# ─── Meta-Evolution API ─────────────────────────────────────────────────
+
+# char* vitalis_meta_select_strategy()
+_lib.vitalis_meta_select_strategy.argtypes = []
+_lib.vitalis_meta_select_strategy.restype = ctypes.c_void_p
+
+# void vitalis_meta_record_result(const char* strategy, const char* function, f64, f64, i32, u64)
+_lib.vitalis_meta_record_result.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_double, ctypes.c_double, ctypes.c_int32, ctypes.c_uint64]
+_lib.vitalis_meta_record_result.restype = None
+
+# char* vitalis_meta_evolve()
+_lib.vitalis_meta_evolve.argtypes = []
+_lib.vitalis_meta_evolve.restype = ctypes.c_void_p
+
+# char* vitalis_meta_landscape()
+_lib.vitalis_meta_landscape.argtypes = []
+_lib.vitalis_meta_landscape.restype = ctypes.c_void_p
+
+# char* vitalis_meta_stats()
+_lib.vitalis_meta_stats.argtypes = []
+_lib.vitalis_meta_stats.restype = ctypes.c_void_p
+
+# char* vitalis_meta_active_params()
+_lib.vitalis_meta_active_params.argtypes = []
+_lib.vitalis_meta_active_params.restype = ctypes.c_void_p
+
+# u64 vitalis_meta_strategy_count()
+_lib.vitalis_meta_strategy_count.argtypes = []
+_lib.vitalis_meta_strategy_count.restype = ctypes.c_uint64
+
+
+def meta_select_strategy() -> str:
+    """Select the best evolution strategy. Returns strategy name."""
+    ptr = _lib.vitalis_meta_select_strategy()
+    return _read_and_free(ptr) or "balanced"
+
+
+def meta_record_result(strategy: str, function_name: str, fitness_before: float, fitness_after: float, success: bool, cycle: int = 0) -> None:
+    """Record a strategy result for meta-evolution learning."""
+    _lib.vitalis_meta_record_result(
+        strategy.encode("utf-8"), function_name.encode("utf-8"),
+        fitness_before, fitness_after, 1 if success else 0, cycle,
+    )
+
+
+def meta_evolve() -> dict:
+    """Run a meta-evolution cycle. Returns result dict."""
+    ptr = _lib.vitalis_meta_evolve()
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"raw": result}
+
+
+def meta_landscape() -> dict:
+    """Get the strategy landscape."""
+    ptr = _lib.vitalis_meta_landscape()
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"raw": result}
+
+
+def meta_stats() -> dict:
+    """Get meta-evolution statistics."""
+    ptr = _lib.vitalis_meta_stats()
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"raw": result}
+
+
+def meta_active_params() -> dict:
+    """Get active strategy parameters."""
+    ptr = _lib.vitalis_meta_active_params()
+    result = _read_and_free(ptr)
+    try:
+        return json.loads(result) if result else {}
+    except json.JSONDecodeError:
+        return {"raw": result}
+
+
+def meta_strategy_count() -> int:
+    """Get the number of evolution strategies."""
+    return _lib.vitalis_meta_strategy_count()
+
+
+# ============================================================================
 # Module metadata
 # ============================================================================
 
@@ -4909,5 +5240,16 @@ __all__ = [
     "v15_error_set_check", "v15_file_roundtrip",
     "v15_pid", "v15_epoch_secs",
     "v15_fibonacci", "v15_factorial", "v15_is_prime", "v15_gcd",
+    # v123: Engine API
+    "engine_init", "engine_register", "engine_evolve", "engine_validate",
+    "engine_cycle", "engine_stats", "engine_landscape", "engine_population_summary",
+    "engine_diagnostics", "engine_error_log",
+    # v123: Memory (Engram) API
+    "memory_store", "memory_recall", "memory_forget", "memory_decay",
+    "memory_consolidate", "memory_stats", "memory_count",
+    "ENGRAM_EPISODIC", "ENGRAM_SEMANTIC", "ENGRAM_PROCEDURAL", "ENGRAM_WORKING", "ENGRAM_EMOTIONAL",
+    # v123: Meta-Evolution API
+    "meta_select_strategy", "meta_record_result", "meta_evolve",
+    "meta_landscape", "meta_stats", "meta_active_params", "meta_strategy_count",
 ]
 

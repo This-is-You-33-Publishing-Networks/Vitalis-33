@@ -4,8 +4,6 @@
 //! dimensionality reduction, regression, optimizers, and evaluation metrics.
 //! All functions are FFI-safe via `extern "C"`.
 
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
 
 // ─── K-Means Clustering ──────────────────────────────────────────────
 

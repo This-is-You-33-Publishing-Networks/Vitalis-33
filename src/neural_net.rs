@@ -534,7 +534,7 @@ impl SwiGLU {
     }
 
     /// SwiGLU(x) = (xW₁ ⊙ Swish(xV)) W₂
-    pub fn forward_swiglu(&self, input: &[f64], batch: usize, dim: usize) -> Vec<f64> {
+    pub fn forward_swiglu(&self, input: &[f64], batch: usize, _dim: usize) -> Vec<f64> {
         let xw1 = self.w1.forward_batch(input, batch);
         let xw3 = self.w3.forward_batch(input, batch);
         // Swish(xW3) = xW3 * sigmoid(xW3)

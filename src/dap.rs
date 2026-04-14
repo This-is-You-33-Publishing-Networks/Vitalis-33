@@ -309,6 +309,222 @@ impl DebugSession {
     }
 }
 
+// ─── DAP Wire Protocol ──────────────────────────────────────────────────
+
+use std::io::{self, BufRead, Write};
+
+/// A parsed DAP request message.
+#[derive(Debug, Clone)]
+pub struct DapRequest {
+    pub seq: i64,
+    pub command: String,
+    pub arguments: String,
+}
+
+/// Read a single DAP message from a buffered reader (Content-Length framed).
+pub fn dap_read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut content_length: Option<usize> = None;
+    let mut header_line = String::new();
+
+    loop {
+        header_line.clear();
+        let n = reader.read_line(&mut header_line)?;
+        if n == 0 { return Ok(None); }
+
+        let trimmed = header_line.trim();
+        if trimmed.is_empty() { break; }
+
+        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
+            if let Ok(len) = val.trim().parse::<usize>() {
+                content_length = Some(len);
+            }
+        }
+    }
+
+    let len = content_length.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
+    })?;
+
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    String::from_utf8(body).map(Some).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, e)
+    })
+}
+
+/// Write a DAP message with Content-Length framing.
+pub fn dap_write_message<W: Write>(writer: &mut W, body: &str) -> io::Result<()> {
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    writer.write_all(header.as_bytes())?;
+    writer.write_all(body.as_bytes())?;
+    writer.flush()
+}
+
+/// Parse a DAP request from a JSON string (minimal parser).
+pub fn parse_dap_request(json: &str) -> Option<DapRequest> {
+    let seq = dap_extract_number(json, "seq")?;
+    let command = dap_extract_string(json, "command")?;
+    let arguments = dap_extract_object(json, "arguments").unwrap_or_default();
+    Some(DapRequest { seq, command, arguments })
+}
+
+/// Format a DAP response.
+pub fn dap_response(request_seq: i64, command: &str, body: &str) -> String {
+    format!(
+        "{{\"seq\":0,\"type\":\"response\",\"request_seq\":{},\"command\":\"{}\",\"success\":true,\"body\":{}}}",
+        request_seq, command, body
+    )
+}
+
+/// Format a DAP event.
+pub fn dap_event(event: &str, body: &str) -> String {
+    format!(
+        "{{\"seq\":0,\"type\":\"event\",\"event\":\"{}\",\"body\":{}}}",
+        event, body
+    )
+}
+
+/// Handle a single DAP request and produce a response.
+pub fn handle_dap_request(session: &mut DebugSession, req: &DapRequest) -> Option<String> {
+    match req.command.as_str() {
+        "initialize" => {
+            session.emit(DapEvent::Initialized);
+            Some(dap_response(req.seq, "initialize", "{\"supportsConfigurationDoneRequest\":true,\"supportsFunctionBreakpoints\":true,\"supportsConditionalBreakpoints\":true}"))
+        }
+        "configurationDone" => {
+            Some(dap_response(req.seq, "configurationDone", "null"))
+        }
+        "launch" => {
+            session.continue_execution();
+            Some(dap_response(req.seq, "launch", "null"))
+        }
+        "disconnect" => {
+            session.stop(0);
+            Some(dap_response(req.seq, "disconnect", "null"))
+        }
+        "setBreakpoints" => {
+            // Acknowledge — breakpoints set via future protocol messages
+            Some(dap_response(req.seq, "setBreakpoints", "{\"breakpoints\":[]}"))
+        }
+        "threads" => {
+            Some(dap_response(req.seq, "threads", "{\"threads\":[{\"id\":1,\"name\":\"main\"}]}"))
+        }
+        "stackTrace" => {
+            let frames_json: Vec<String> = session.stack.iter().rev().map(|f| {
+                format!(
+                    "{{\"id\":{},\"name\":\"{}\",\"source\":{{\"path\":\"{}\"}},\"line\":{},\"column\":{}}}",
+                    f.id, f.name, f.location.file, f.location.line, f.location.column
+                )
+            }).collect();
+            Some(dap_response(req.seq, "stackTrace", &format!("{{\"stackFrames\":[{}],\"totalFrames\":{}}}", frames_json.join(","), session.stack.len())))
+        }
+        "continue" => {
+            session.continue_execution();
+            Some(dap_response(req.seq, "continue", "{\"allThreadsContinued\":true}"))
+        }
+        "stepIn" => {
+            session.step_in();
+            Some(dap_response(req.seq, "stepIn", "null"))
+        }
+        "stepOut" => {
+            session.step_out();
+            Some(dap_response(req.seq, "stepOut", "null"))
+        }
+        "next" => {
+            session.step_over();
+            Some(dap_response(req.seq, "next", "null"))
+        }
+        _ => {
+            Some(format!(
+                "{{\"seq\":0,\"type\":\"response\",\"request_seq\":{},\"command\":\"{}\",\"success\":false,\"message\":\"unsupported command\"}}",
+                req.seq, req.command
+            ))
+        }
+    }
+}
+
+/// Run the DAP server on stdin/stdout. Entry point for `vtc debug`.
+pub fn run_dap_stdio() -> io::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = io::BufReader::new(stdin.lock());
+    let mut writer = stdout.lock();
+    let mut session = DebugSession::new();
+
+    loop {
+        let msg_text = match dap_read_message(&mut reader)? {
+            Some(text) => text,
+            None => break,
+        };
+
+        let req = match parse_dap_request(&msg_text) {
+            Some(req) => req,
+            None => continue,
+        };
+
+        let is_disconnect = req.command == "disconnect";
+
+        if let Some(response) = handle_dap_request(&mut session, &req) {
+            dap_write_message(&mut writer, &response)?;
+        }
+
+        if is_disconnect {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+// ─── Minimal JSON Helpers ───────────────────────────────────────────────
+
+fn dap_extract_string(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\"", key);
+    let idx = json.find(&pattern)?;
+    let rest = &json[idx + pattern.len()..];
+    let colon = rest.find(':')?;
+    let after = rest[colon + 1..].trim_start();
+    if after.starts_with('"') {
+        let start = 1;
+        let end = after[start..].find('"')?;
+        Some(after[start..start + end].to_string())
+    } else {
+        None
+    }
+}
+
+fn dap_extract_number(json: &str, key: &str) -> Option<i64> {
+    let pattern = format!("\"{}\"", key);
+    let idx = json.find(&pattern)?;
+    let rest = &json[idx + pattern.len()..];
+    let colon = rest.find(':')?;
+    let after = rest[colon + 1..].trim_start();
+    let end = after.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(after.len());
+    after[..end].parse().ok()
+}
+
+fn dap_extract_object(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\"", key);
+    let idx = json.find(&pattern)?;
+    let rest = &json[idx + pattern.len()..];
+    let brace = rest.find('{')?;
+    let mut depth = 0;
+    let start = brace;
+    for (i, c) in rest[start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(rest[start..start + i + 1].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
@@ -561,5 +777,167 @@ mod tests {
         };
         assert_eq!(loc.file, "test.sl");
         assert_eq!(loc.line, 42);
+    }
+
+    // ── v104: DAP wire protocol tests ──────────────────────────────────
+
+    #[test]
+    fn test_dap_read_message() {
+        let input = b"Content-Length: 13\r\n\r\n{\"test\":true}";
+        let mut reader = std::io::BufReader::new(&input[..]);
+        let msg = dap_read_message(&mut reader).unwrap();
+        assert_eq!(msg, Some("{\"test\":true}".to_string()));
+    }
+
+    #[test]
+    fn test_dap_read_message_eof() {
+        let input = b"";
+        let mut reader = std::io::BufReader::new(&input[..]);
+        let msg = dap_read_message(&mut reader).unwrap();
+        assert_eq!(msg, None);
+    }
+
+    #[test]
+    fn test_dap_write_message() {
+        let mut buf = Vec::new();
+        dap_write_message(&mut buf, "{\"ok\":1}").unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.starts_with("Content-Length: 8\r\n\r\n"));
+        assert!(output.ends_with("{\"ok\":1}"));
+    }
+
+    #[test]
+    fn test_parse_dap_request() {
+        let json = r#"{"seq":1,"type":"request","command":"initialize","arguments":{}}"#;
+        let req = parse_dap_request(json).unwrap();
+        assert_eq!(req.seq, 1);
+        assert_eq!(req.command, "initialize");
+    }
+
+    #[test]
+    fn test_dap_response_format() {
+        let resp = dap_response(1, "initialize", "{}");
+        assert!(resp.contains("\"request_seq\":1"));
+        assert!(resp.contains("\"command\":\"initialize\""));
+        assert!(resp.contains("\"success\":true"));
+    }
+
+    #[test]
+    fn test_dap_event_format() {
+        let evt = dap_event("stopped", "{\"reason\":\"breakpoint\"}");
+        assert!(evt.contains("\"event\":\"stopped\""));
+        assert!(evt.contains("\"reason\":\"breakpoint\""));
+    }
+
+    #[test]
+    fn test_handle_dap_initialize() {
+        let mut session = DebugSession::new();
+        let req = DapRequest { seq: 1, command: "initialize".to_string(), arguments: "{}".to_string() };
+        let resp = handle_dap_request(&mut session, &req);
+        assert!(resp.is_some());
+        assert!(resp.unwrap().contains("supportsConfigurationDoneRequest"));
+    }
+
+    #[test]
+    fn test_handle_dap_threads() {
+        let mut session = DebugSession::new();
+        let req = DapRequest { seq: 2, command: "threads".to_string(), arguments: "{}".to_string() };
+        let resp = handle_dap_request(&mut session, &req).unwrap();
+        assert!(resp.contains("\"name\":\"main\""));
+    }
+
+    #[test]
+    fn test_handle_dap_stack_trace() {
+        let mut session = DebugSession::new();
+        session.push_frame("main", "test.sl", 1);
+        session.push_frame("helper", "test.sl", 10);
+        let req = DapRequest { seq: 3, command: "stackTrace".to_string(), arguments: "{}".to_string() };
+        let resp = handle_dap_request(&mut session, &req).unwrap();
+        assert!(resp.contains("\"name\":\"helper\""));
+        assert!(resp.contains("\"totalFrames\":2"));
+    }
+
+    #[test]
+    fn test_handle_dap_continue() {
+        let mut session = DebugSession::new();
+        let req = DapRequest { seq: 4, command: "continue".to_string(), arguments: "{}".to_string() };
+        let resp = handle_dap_request(&mut session, &req).unwrap();
+        assert!(resp.contains("allThreadsContinued"));
+        assert_eq!(session.state, ExecutionState::Running);
+    }
+
+    #[test]
+    fn test_handle_dap_step_operations() {
+        let mut session = DebugSession::new();
+
+        let req = DapRequest { seq: 5, command: "stepIn".to_string(), arguments: "{}".to_string() };
+        handle_dap_request(&mut session, &req);
+        assert_eq!(session.state, ExecutionState::SteppingIn);
+
+        let req = DapRequest { seq: 6, command: "next".to_string(), arguments: "{}".to_string() };
+        handle_dap_request(&mut session, &req);
+        assert_eq!(session.state, ExecutionState::SteppingOver);
+
+        let req = DapRequest { seq: 7, command: "stepOut".to_string(), arguments: "{}".to_string() };
+        handle_dap_request(&mut session, &req);
+        assert_eq!(session.state, ExecutionState::SteppingOut);
+    }
+
+    #[test]
+    fn test_handle_dap_disconnect() {
+        let mut session = DebugSession::new();
+        let req = DapRequest { seq: 8, command: "disconnect".to_string(), arguments: "{}".to_string() };
+        let resp = handle_dap_request(&mut session, &req).unwrap();
+        assert!(resp.contains("\"success\":true"));
+        assert_eq!(session.state, ExecutionState::Stopped);
+    }
+
+    #[test]
+    fn test_handle_dap_unknown_command() {
+        let mut session = DebugSession::new();
+        let req = DapRequest { seq: 9, command: "unknown".to_string(), arguments: "{}".to_string() };
+        let resp = handle_dap_request(&mut session, &req).unwrap();
+        assert!(resp.contains("\"success\":false"));
+        assert!(resp.contains("unsupported command"));
+    }
+
+    #[test]
+    fn test_dap_json_helpers() {
+        let json = r#"{"seq":42,"command":"launch","arguments":{"program":"test.sl"}}"#;
+        assert_eq!(dap_extract_number(json, "seq"), Some(42));
+        assert_eq!(dap_extract_string(json, "command"), Some("launch".to_string()));
+        assert!(dap_extract_object(json, "arguments").is_some());
+    }
+
+    #[test]
+    fn test_dap_full_lifecycle_via_messages() {
+        let init = r#"{"seq":1,"type":"request","command":"initialize","arguments":{}}"#;
+        let config_done = r#"{"seq":2,"type":"request","command":"configurationDone","arguments":{}}"#;
+        let launch = r#"{"seq":3,"type":"request","command":"launch","arguments":{}}"#;
+
+        let mut input = Vec::new();
+        for msg in &[init, config_done, launch] {
+            let header = format!("Content-Length: {}\r\n\r\n", msg.len());
+            input.extend_from_slice(header.as_bytes());
+            input.extend_from_slice(msg.as_bytes());
+        }
+
+        let mut reader = std::io::BufReader::new(&input[..]);
+        let mut writer = Vec::new();
+        let mut session = DebugSession::new();
+
+        for _ in 0..3 {
+            if let Some(text) = dap_read_message(&mut reader).unwrap() {
+                if let Some(req) = parse_dap_request(&text) {
+                    if let Some(resp) = handle_dap_request(&mut session, &req) {
+                        dap_write_message(&mut writer, &resp).unwrap();
+                    }
+                }
+            }
+        }
+
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.contains("supportsConfigurationDoneRequest"));
+        assert_eq!(session.state, ExecutionState::Running);
     }
 }

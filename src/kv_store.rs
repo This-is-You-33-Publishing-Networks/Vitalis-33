@@ -9,7 +9,6 @@
 //! - **Write batching**: Group commits for throughput
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::Instant;
 
 // ── MemTable (In-Memory Write Buffer) ────────────────────────────────
 

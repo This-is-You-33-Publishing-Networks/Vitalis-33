@@ -12,7 +12,21 @@ use std::fmt;
 #[logos(skip r"[ \t\r]+")]  // skip whitespace (not newlines — they're significant for some rules)
 pub enum Token {
     // ── Literals ──────────────────────────────────────────────────────
-    #[regex(r"-?[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
+    #[regex(r"-?(0[xX][0-9a-fA-F][0-9a-fA-F_]*|0[bB][01][01_]*|0[oO][0-7][0-7_]*|[0-9][0-9_]*)", |lex| {
+        let s = lex.slice();
+        let (negative, s) = if s.starts_with('-') { (true, &s[1..]) } else { (false, s) };
+        let s_clean: String = s.chars().filter(|c| *c != '_').collect();
+        let val = if s_clean.starts_with("0x") || s_clean.starts_with("0X") {
+            i64::from_str_radix(&s_clean[2..], 16).ok()
+        } else if s_clean.starts_with("0b") || s_clean.starts_with("0B") {
+            i64::from_str_radix(&s_clean[2..], 2).ok()
+        } else if s_clean.starts_with("0o") || s_clean.starts_with("0O") {
+            i64::from_str_radix(&s_clean[2..], 8).ok()
+        } else {
+            s_clean.parse::<i64>().ok()
+        };
+        val.map(|v| if negative { -v } else { v })
+    })]
     IntLiteral(i64),
 
     #[regex(r"-?[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?", |lex| lex.slice().parse::<f64>().ok())]
@@ -672,6 +686,114 @@ mod tests {
         assert_eq!(tokens[1].token, Token::Capability);
         assert_eq!(tokens[2].token, Token::Immutable);
         assert_eq!(tokens[3].token, Token::Evolvable);
+    }
+
+    // ── v138 Hex/Binary/Octal Literal Tests ───────────────────────
+
+    #[test]
+    fn test_v138_hex_literal() {
+        let (tokens, errors) = lex("0xFF");
+        assert!(errors.is_empty(), "Errors: {:?}", errors);
+        assert_eq!(tokens[0].token, Token::IntLiteral(255));
+    }
+
+    #[test]
+    fn test_v138_hex_uppercase() {
+        let (tokens, errors) = lex("0XFF");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(255));
+    }
+
+    #[test]
+    fn test_v138_hex_mixed_case() {
+        let (tokens, errors) = lex("0xDeAdBeEf");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(0xDEADBEEF));
+    }
+
+    #[test]
+    fn test_v138_binary_literal() {
+        let (tokens, errors) = lex("0b1010");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(10));
+    }
+
+    #[test]
+    fn test_v138_binary_uppercase() {
+        let (tokens, errors) = lex("0B1100");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(12));
+    }
+
+    #[test]
+    fn test_v138_octal_literal() {
+        let (tokens, errors) = lex("0o77");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(63));
+    }
+
+    #[test]
+    fn test_v138_octal_uppercase() {
+        let (tokens, errors) = lex("0O10");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(8));
+    }
+
+    #[test]
+    fn test_v138_underscores_in_decimal() {
+        let (tokens, errors) = lex("1_000_000");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(1_000_000));
+    }
+
+    #[test]
+    fn test_v138_underscores_in_hex() {
+        let (tokens, errors) = lex("0xFF_FF");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(0xFFFF));
+    }
+
+    #[test]
+    fn test_v138_underscores_in_binary() {
+        let (tokens, errors) = lex("0b1111_0000");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(0xF0));
+    }
+
+    #[test]
+    fn test_v138_negative_hex() {
+        let (tokens, errors) = lex("-0xFF");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(-255));
+    }
+
+    #[test]
+    fn test_v138_hex_in_expression() {
+        let (tokens, errors) = lex("let x = 0xFF + 0b1010");
+        assert!(errors.is_empty());
+        let int_tokens: Vec<_> = tokens.iter()
+            .filter_map(|t| if let Token::IntLiteral(n) = &t.token { Some(*n) } else { None })
+            .collect();
+        assert_eq!(int_tokens, vec![255, 10]);
+    }
+
+    #[test]
+    fn test_v138_existing_decimal_still_works() {
+        let (tokens, errors) = lex("42 -7 0 100");
+        assert!(errors.is_empty());
+        assert_eq!(tokens[0].token, Token::IntLiteral(42));
+        assert_eq!(tokens[1].token, Token::IntLiteral(-7));
+        assert_eq!(tokens[2].token, Token::IntLiteral(0));
+        assert_eq!(tokens[3].token, Token::IntLiteral(100));
+    }
+
+    #[test]
+    fn test_v138_hex_in_function() {
+        let source = "fn main() -> i64 { return 0xFF; }";
+        let (tokens, errors) = lex(source);
+        assert!(errors.is_empty());
+        let hex_token = tokens.iter().find(|t| matches!(t.token, Token::IntLiteral(255)));
+        assert!(hex_token.is_some(), "Should contain IntLiteral(255) from 0xFF");
     }
 
 }

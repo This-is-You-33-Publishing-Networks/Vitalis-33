@@ -8,7 +8,6 @@
 //! - **HAL traits**: Hardware abstraction layer interfaces
 //! - **ARM / RISC-V targets**: Multi-architecture support
 
-use std::collections::HashMap;
 
 // ── Memory Map ──────────────────────────────────────────────────────
 

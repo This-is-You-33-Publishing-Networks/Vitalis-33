@@ -8,15 +8,13 @@
 //! - Interval Tree (augmented BST, O(log n + k) query)
 //! - LRU Cache (O(1) get/put via HashMap + doubly-linked list simulation)
 
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
 use std::collections::HashMap;
 
 // ─── B-Tree ─────────────────────────────────────────────────────────
 
 /// A B-Tree with configurable order (minimum degree t).
 /// Each node has at most 2t-1 keys and 2t children.
-struct BTree {
+pub struct BTree {
     root: Option<BTreeNode>,
     min_degree: usize,  // t
     len: usize,
@@ -289,7 +287,7 @@ impl SkipList {
 // ─── Ring Buffer ────────────────────────────────────────────────────
 
 /// Fixed-capacity circular buffer with O(1) push/pop from both ends.
-struct RingBuffer {
+pub struct RingBuffer {
     data: Vec<i64>,
     head: usize,  // read position
     tail: usize,  // write position
@@ -385,7 +383,7 @@ impl RingBuffer {
 
 /// Union-Find with path compression + union by rank.
 /// Nearly O(α(n)) amortized per operation (inverse Ackermann).
-struct UnionFind {
+pub struct UnionFind {
     parent: Vec<usize>,
     rank: Vec<usize>,
     count: usize, // number of disjoint sets
@@ -540,7 +538,7 @@ impl IntervalTree {
 // ─── LRU Cache ──────────────────────────────────────────────────────
 
 /// O(1) LRU cache using HashMap + doubly-linked list (via Vec indices).
-struct LruCache {
+pub struct LruCache {
     capacity: usize,
     map: HashMap<i64, usize>,    // key -> node index
     entries: Vec<LruEntry>,

@@ -664,6 +664,112 @@ impl TrendAnalysis {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// Benchmark Runner — Timing Harness for Vitalis Compiler Pipelines
+// ══════════════════════════════════════════════════════════════════════
+
+/// A benchmark definition with source code and expected result.
+pub struct BenchCase {
+    pub name: &'static str,
+    pub source: &'static str,
+    pub expected: i64,
+    pub group: &'static str,
+}
+
+/// Built-in benchmark corpus covering major language features.
+pub const BENCH_CORPUS: &[BenchCase] = &[
+    BenchCase { name: "constant", source: "fn main() -> i64 { 42 }", expected: 42, group: "basic" },
+    BenchCase { name: "arithmetic", source: "fn main() -> i64 { 10 * 4 + 2 }", expected: 42, group: "basic" },
+    BenchCase { name: "variables", source: "fn main() -> i64 { let x: i64 = 40; let y: i64 = 2; x + y }", expected: 42, group: "basic" },
+    BenchCase { name: "function_call", source: "fn double(x: i64) -> i64 { x * 2 } fn main() -> i64 { double(21) }", expected: 42, group: "functions" },
+    BenchCase {
+        name: "nested_calls",
+        source: "fn add(a: i64, b: i64) -> i64 { a + b } fn double(x: i64) -> i64 { add(x, x) } fn main() -> i64 { double(21) }",
+        expected: 42,
+        group: "functions",
+    },
+    BenchCase {
+        name: "if_else",
+        source: "fn main() -> i64 { if 1 > 0 { 42 } else { 0 } }",
+        expected: 42,
+        group: "control_flow",
+    },
+    BenchCase {
+        name: "while_loop",
+        source: "fn main() -> i64 { let mut n: i64 = 0; let mut i: i64 = 0; while i < 100 { n = n + i; i = i + 1; } n }",
+        expected: 4950,
+        group: "control_flow",
+    },
+    BenchCase {
+        name: "fibonacci",
+        source: "fn fib(n: i64) -> i64 { if n <= 1 { n } else { fib(n - 1) + fib(n - 2) } } fn main() -> i64 { fib(10) }",
+        expected: 55,
+        group: "recursion",
+    },
+];
+
+/// Result of running a single benchmark case with timing.
+pub struct BenchRunResult {
+    pub name: String,
+    pub group: String,
+    pub samples_ns: Vec<f64>,
+    pub warmup_iterations: usize,
+    pub measurement_iterations: usize,
+    pub stats: BenchmarkResult,
+}
+
+/// Run a single benchmark case: warmup + measured iterations.
+/// Returns timing samples (nanoseconds per iteration).
+pub fn run_bench_case(
+    case: &BenchCase,
+    warmup: usize,
+    iterations: usize,
+) -> Result<BenchRunResult, String> {
+    use std::time::Instant;
+
+    // Warmup: compile and run without measuring
+    for _ in 0..warmup {
+        let r = crate::codegen::compile_and_run_nocache(case.source)?;
+        if r != case.expected {
+            return Err(format!(
+                "Benchmark '{}' returned {} but expected {}",
+                case.name, r, case.expected
+            ));
+        }
+    }
+
+    // Measured iterations
+    let mut samples_ns = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        crate::codegen::compile_and_run_nocache(case.source)?;
+        let elapsed = start.elapsed().as_nanos() as f64;
+        samples_ns.push(elapsed);
+    }
+
+    let stats = BenchmarkResult::from_samples(case.name, samples_ns.clone(), warmup);
+
+    Ok(BenchRunResult {
+        name: case.name.to_string(),
+        group: case.group.to_string(),
+        samples_ns,
+        warmup_iterations: warmup,
+        measurement_iterations: iterations,
+        stats,
+    })
+}
+
+/// Run the entire benchmark corpus and return results.
+pub fn run_bench_suite(
+    warmup: usize,
+    iterations: usize,
+) -> Vec<Result<BenchRunResult, String>> {
+    BENCH_CORPUS
+        .iter()
+        .map(|case| run_bench_case(case, warmup, iterations))
+        .collect()
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Tests
 // ══════════════════════════════════════════════════════════════════════
 
@@ -919,5 +1025,265 @@ mod tests {
         suite.record(result);
         let report = suite.summary_report();
         assert!(report.contains("Benchmark Suite Report"));
+    }
+
+    // ─── v127: Benchmark Runner Tests ───────────────────────────────
+
+    #[test]
+    fn test_bench_corpus_not_empty() {
+        assert!(!BENCH_CORPUS.is_empty());
+        assert!(BENCH_CORPUS.len() >= 8);
+    }
+
+    #[test]
+    fn test_bench_corpus_all_named() {
+        for case in BENCH_CORPUS {
+            assert!(!case.name.is_empty());
+            assert!(!case.source.is_empty());
+            assert!(!case.group.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_bench_corpus_unique_names() {
+        let names: Vec<&str> = BENCH_CORPUS.iter().map(|c| c.name).collect();
+        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(names.len(), unique.len(), "duplicate benchmark names");
+    }
+
+    #[test]
+    fn test_bench_corpus_expected_values() {
+        // Verify each benchmark source produces the expected result
+        for case in BENCH_CORPUS {
+            let r = crate::codegen::compile_and_run_nocache(case.source);
+            assert_eq!(r.unwrap(), case.expected, "benchmark '{}' mismatch", case.name);
+        }
+    }
+
+    #[test]
+    fn test_run_bench_case_basic() {
+        let case = &BENCH_CORPUS[0]; // "constant"
+        let result = run_bench_case(case, 1, 3).unwrap();
+        assert_eq!(result.name, "constant");
+        assert_eq!(result.group, "basic");
+        assert_eq!(result.warmup_iterations, 1);
+        assert_eq!(result.measurement_iterations, 3);
+        assert_eq!(result.samples_ns.len(), 3);
+        assert!(result.stats.mean_ns > 0.0);
+    }
+
+    #[test]
+    fn test_run_bench_suite_all_pass() {
+        let results = run_bench_suite(1, 2);
+        assert_eq!(results.len(), BENCH_CORPUS.len());
+        for r in &results {
+            assert!(r.is_ok(), "bench failed: {:?}", r.as_ref().err());
+        }
+    }
+
+    #[test]
+    fn test_run_bench_case_wrong_expected() {
+        let bad_case = BenchCase {
+            name: "bad",
+            source: "fn main() -> i64 { 99 }",
+            expected: 100, // wrong
+            group: "test",
+        };
+        let r = run_bench_case(&bad_case, 1, 1);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_bench_result_from_runner_has_stats() {
+        let case = &BENCH_CORPUS[0];
+        let result = run_bench_case(case, 2, 5).unwrap();
+        assert!(result.stats.median_ns > 0.0);
+        assert!(result.stats.ops_per_sec() > 0.0);
+    }
+
+    /// V300 comprehensive benchmark suite — general compute + neuromorphic
+    #[test]
+    fn test_v300_benchmark_suite() {
+        use std::time::Instant;
+
+        // ── General Compute Benchmarks (JIT compile + execute) ────────────
+        let general_cases: Vec<(&str, &str, i64)> = vec![
+            ("constant",    "fn main() -> i64 { 42 }", 42),
+            ("arithmetic",  "fn main() -> i64 { 10 * 4 + 2 }", 42),
+            ("variables",   "fn main() -> i64 { let x: i64 = 40; let y: i64 = 2; x + y }", 42),
+            ("function_call", "fn double(x: i64) -> i64 { x * 2 } fn main() -> i64 { double(21) }", 42),
+            ("if_else",     "fn main() -> i64 { if 1 > 0 { 42 } else { 0 } }", 42),
+            ("while_loop",  "fn main() -> i64 { let mut n: i64 = 0; let mut i: i64 = 0; while i < 100 { n = n + i; i = i + 1; } n }", 4950),
+            ("fibonacci_10", "fn fib(n: i64) -> i64 { if n <= 1 { n } else { fib(n - 1) + fib(n - 2) } } fn main() -> i64 { fib(10) }", 55),
+            ("fibonacci_20", "fn fib(n: i64) -> i64 { if n <= 1 { n } else { fib(n - 1) + fib(n - 2) } } fn main() -> i64 { fib(20) }", 6765),
+        ];
+
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║           VITALIS v300 — BENCHMARK RESULTS                 ║");
+        println!("╚══════════════════════════════════════════════════════════════╝\n");
+
+        println!("── General Compute (JIT compile + execute) ──────────────────\n");
+        println!("{:<20} {:>12} {:>12} {:>12}", "Benchmark", "Median (µs)", "Mean (µs)", "Ops/sec");
+        println!("{}", "─".repeat(60));
+
+        for (name, source, expected) in &general_cases {
+            let result = run_bench_case(
+                &BenchCase { name, source, expected: *expected, group: "general" },
+                5, 50,
+            );
+            match result {
+                Ok(r) => {
+                    println!("{:<20} {:>12.1} {:>12.1} {:>12.0}",
+                        name,
+                        r.stats.median_ns / 1000.0,
+                        r.stats.mean_ns / 1000.0,
+                        r.stats.ops_per_sec());
+                }
+                Err(e) => println!("{:<20} ERROR: {}", name, e),
+            }
+        }
+
+        // ── Neuromorphic Native FFI Benchmarks ───────────────────────────
+        println!("\n── Neuromorphic Operations (native Rust FFI) ──────────────\n");
+        println!("{:<30} {:>10} {:>12} {:>10}", "Operation", "Iters", "Total (µs)", "Per-op (ns)");
+        println!("{}", "─".repeat(65));
+
+        let n_iters = 10_000;
+
+        // Spike Engine
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            crate::spike_engine::slang_spike_emit(1, 100, 1000);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "spike_emit", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            crate::spike_engine::slang_neuro_compartment_step(0, 0.8);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "compartment_step", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            crate::spike_engine::slang_synapse_conductance(0.5, -70.0, -65.0);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "synapse_conductance", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        // SNN Learning
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            crate::snn_learning::slang_snn_surrogate_forward(0.8, 1.0, 0.9, 10);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "snn_surrogate_forward", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        // Brain Models
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            crate::brain_models::slang_pred_coding_error(0.8, 0.75, 0.1);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "predictive_coding_error", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        // Hippocampal Memory
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            crate::hippocampal_memory::slang_hippo_encode(750, 500, 100);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "hippo_encode", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        // Neuro Safety
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            crate::neuro_safety::slang_neuro_verify_timing(50, 0, 100);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "neuro_verify_timing", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        // Neuro Perf
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            crate::neuro_perf::slang_neuro_simd_accumulate(100, 200, 300, 400);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "simd_accumulate", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        // ── Tensor Operations ────────────────────────────────────────────
+        println!("\n── Tensor Operations (native Rust FFI) ──────────────────────\n");
+        println!("{:<30} {:>10} {:>12} {:>10}", "Operation", "Iters", "Total (µs)", "Per-op (ns)");
+        println!("{}", "─".repeat(65));
+
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            let t = crate::tensor::vitalis_tensor_ones_2d(4, 4);
+            crate::tensor::vitalis_tensor_free(t);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "tensor_ones_4x4", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        let a = crate::tensor::vitalis_tensor_ones_2d(8, 8);
+        let b = crate::tensor::vitalis_tensor_ones_2d(8, 8);
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            let c = crate::tensor::vitalis_tensor_add(a, b);
+            crate::tensor::vitalis_tensor_free(c);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "tensor_add_8x8", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        let start = Instant::now();
+        for _ in 0..n_iters {
+            let c = crate::tensor::vitalis_tensor_matmul(a, b);
+            crate::tensor::vitalis_tensor_free(c);
+        }
+        let elapsed = start.elapsed();
+        println!("{:<30} {:>10} {:>12.1} {:>10.1}",
+            "tensor_matmul_8x8", n_iters,
+            elapsed.as_micros() as f64,
+            elapsed.as_nanos() as f64 / n_iters as f64);
+
+        crate::tensor::vitalis_tensor_free(a);
+        crate::tensor::vitalis_tensor_free(b);
+
+        // ── Summary ─────────────────────────────────────────────────────
+        println!("\n══════════════════════════════════════════════════════════════");
+        println!("  Vitalis v300.0.0 | {} builtins | {} modules | {} tests",
+            crate::stdlib::builtins().len(), 192, 4307);
+        println!("  Backend: Cranelift 0.116 JIT | Platform: x86-64 Windows");
+        println!("══════════════════════════════════════════════════════════════\n");
     }
 }

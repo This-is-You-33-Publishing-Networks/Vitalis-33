@@ -452,10 +452,36 @@ impl RegionAnalyzer {
 
     /// Solve all collected constraints and return errors.
     ///
-    /// Uses a fixed-point iteration approach: expand region scopes upward
-    /// until all outlives constraints are satisfied or a contradiction is found.
+    /// Uses a fixed-point iteration approach:
+    /// 1. Compute transitive closure of the outlives graph
+    /// 2. Validate all constraints against scope depth semantics
+    /// 3. Detect cycles (contradictory constraints)
     pub fn solve(&mut self) -> Vec<LifetimeError> {
-        // Phase 1: Check outlives constraints using scope depth heuristic
+        // Phase 0: Compute transitive closure of outlives graph
+        // If 'a: 'b and 'b: 'c then 'a: 'c
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let snapshot: Vec<(LifetimeId, Vec<LifetimeId>)> = self.outlives_graph
+                .iter()
+                .map(|(k, v)| (*k, v.iter().copied().collect()))
+                .collect();
+
+            for (node, neighbors) in &snapshot {
+                for &neighbor in neighbors {
+                    if let Some(transitive) = self.outlives_graph.get(&neighbor).cloned() {
+                        let entry = self.outlives_graph.entry(*node).or_default();
+                        for t in transitive {
+                            if t != *node && entry.insert(t) {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 1: Check outlives constraints using scope depth semantics
         for constraint in &self.constraints {
             match constraint {
                 LifetimeConstraint::Outlives { longer, shorter, reason } => {
@@ -523,7 +549,46 @@ impl RegionAnalyzer {
             }
         }
 
-        // Phase 2: Check for cycles in the outlives graph (impossible constraints)
+        // Phase 2: Check transitive outlives violations
+        // Now that we have the full transitive closure, validate all implied constraints
+        let graph_snapshot: Vec<(LifetimeId, Vec<LifetimeId>)> = self.outlives_graph
+            .iter()
+            .map(|(k, v)| (*k, v.iter().copied().collect()))
+            .collect();
+
+        for (longer, shorters) in &graph_snapshot {
+            let longer_is_static = self.regions.get(longer)
+                .map(|r| r.kind == RegionKind::Static).unwrap_or(false);
+            if longer_is_static {
+                continue;
+            }
+            let longer_depth = self.regions.get(longer)
+                .map(|r| r.scope_depth).unwrap_or(0);
+
+            for shorter in shorters {
+                let shorter_depth = self.regions.get(shorter)
+                    .map(|r| r.scope_depth).unwrap_or(0);
+                if longer_depth > shorter_depth && shorter_depth > 0 {
+                    // Check we haven't already reported this exact error
+                    let already_reported = self.errors.iter().any(|e| {
+                        e.message.contains(&format!("region {} (depth {})", longer, longer_depth))
+                            && e.message.contains(&format!("region {} (depth {})", shorter, shorter_depth))
+                    });
+                    if !already_reported {
+                        self.errors.push(LifetimeError {
+                            kind: LifetimeErrorKind::DanglingReference,
+                            message: format!(
+                                "transitive outlives violation: region {} (depth {}) does not outlive region {} (depth {})",
+                                longer, longer_depth, shorter, shorter_depth
+                            ),
+                            hint: Some("a transitive outlives chain requires the borrow to live longer".to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Check for cycles in the outlives graph (impossible constraints)
         self.detect_outlives_cycles();
 
         self.errors.clone()
@@ -671,7 +736,7 @@ impl RegionAnalyzer {
 //  Program-Level Lifetime Checker
 // ═══════════════════════════════════════════════════════════════════════
 
-use crate::ast::{Block, Expr, Function, Param, Program, Stmt, TopLevel};
+use crate::ast::{Block, Expr, Function, Program, Stmt, TopLevel};
 
 /// High-level lifetime checker that operates on the AST.
 pub struct LifetimeChecker {
@@ -798,7 +863,7 @@ mod tests {
 
     #[test]
     fn test_static_lifetime() {
-        let mut analyzer = RegionAnalyzer::new();
+        let analyzer = RegionAnalyzer::new();
         let static_id = analyzer.resolve_lifetime("static").unwrap();
         assert_eq!(static_id, LifetimeId(0));
         assert!(analyzer.regions().get(&static_id).unwrap().kind == RegionKind::Static);
@@ -821,7 +886,7 @@ mod tests {
         analyzer.enter_function("test_fn");
         let scope = analyzer.enter_scope();
 
-        let borrow_region = analyzer.create_borrow("x", false);
+        let _borrow_region = analyzer.create_borrow("x", false);
         assert!(analyzer.is_borrowed("x"));
         assert!(!analyzer.is_mutably_borrowed("x"));
 
@@ -950,5 +1015,141 @@ mod tests {
         assert!(analyzer.resolve_lifetime("a").is_none());
         assert!(analyzer.resolve_lifetime("static").is_some());
         assert!(!analyzer.is_borrowed("x"));
+    }
+
+    // ─── v131 tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_v131_transitive_outlives() {
+        let mut analyzer = RegionAnalyzer::new();
+        analyzer.enter_function("test_fn");
+        let a = analyzer.declare_lifetime("a");
+        let b = analyzer.declare_lifetime("b");
+        let c = analyzer.declare_lifetime("c");
+
+        // 'a: 'b, 'b: 'c → 'a: 'c (transitive)
+        analyzer.add_outlives(a, b, "a > b");
+        analyzer.add_outlives(b, c, "b > c");
+        let _ = analyzer.solve();
+
+        // After solving, transitive closure means 'a outlives 'c
+        assert!(analyzer.outlives(a, c), "Transitive outlives should hold: a > c");
+    }
+
+    #[test]
+    fn test_v131_transitive_violation() {
+        let mut analyzer = RegionAnalyzer::new();
+        analyzer.enter_function("test_fn");
+
+        let outer = analyzer.enter_scope(); // depth 2
+        let a = analyzer.declare_lifetime("a");
+
+        let mid = analyzer.enter_scope(); // depth 3
+        let b = analyzer.declare_lifetime("b");
+
+        let inner = analyzer.enter_scope(); // depth 4
+        let c = analyzer.create_borrow("z", false); // depth 4
+
+        // c (depth 4) outlives b (depth 3) — this is fine
+        analyzer.add_outlives(c, b, "c > b");
+        // b (depth 3) outlives a (depth 2) — this is fine individually
+        analyzer.add_outlives(b, a, "b > a");
+        // But transitively c (depth 4) must outlive a (depth 2) — violation!
+
+        analyzer.leave_scope(inner);
+        analyzer.leave_scope(mid);
+        analyzer.leave_scope(outer);
+
+        let errors = analyzer.solve();
+        // Should detect the transitive violation
+        assert!(errors.iter().any(|e| e.kind == LifetimeErrorKind::DanglingReference),
+            "Should detect transitive outlives violation: {:?}", errors);
+    }
+
+    #[test]
+    fn test_v131_equality_constraints() {
+        let mut analyzer = RegionAnalyzer::new();
+        analyzer.enter_function("test_fn");
+
+        let scope = analyzer.enter_scope();
+        let a = analyzer.declare_lifetime("a");
+        let b = analyzer.declare_lifetime("b");
+
+        analyzer.add_equality(a, b, "same scope");
+        let errors = analyzer.solve();
+        // Same scope depth → no error
+        assert!(errors.is_empty(), "Equal lifetimes at same depth: {:?}", errors);
+
+        analyzer.leave_scope(scope);
+        analyzer.leave_function();
+    }
+
+    #[test]
+    fn test_v131_static_outlives_all() {
+        let mut analyzer = RegionAnalyzer::new();
+        analyzer.enter_function("test_fn");
+
+        let static_id = analyzer.resolve_lifetime("static").unwrap();
+        let scope = analyzer.enter_scope();
+        let a = analyzer.declare_lifetime("a");
+
+        // 'static: 'a — should always succeed
+        analyzer.add_outlives(static_id, a, "static outlives a");
+        let errors = analyzer.solve();
+        assert!(errors.is_empty(), "'static should outlive anything: {:?}", errors);
+
+        analyzer.leave_scope(scope);
+        analyzer.leave_function();
+    }
+
+    #[test]
+    fn test_v131_multiple_borrows_no_conflict() {
+        let mut analyzer = RegionAnalyzer::new();
+        analyzer.enter_function("test_fn");
+        let scope = analyzer.enter_scope();
+
+        // Multiple shared borrows should be fine
+        analyzer.create_borrow("x", false);
+        analyzer.create_borrow("x", false);
+        assert!(analyzer.errors().is_empty(), "Multiple shared borrows should work");
+
+        analyzer.leave_scope(scope);
+        analyzer.leave_function();
+    }
+
+    #[test]
+    fn test_v131_live_at_constraint() {
+        let mut analyzer = RegionAnalyzer::new();
+        analyzer.enter_function("test_fn");
+        let scope = analyzer.enter_scope();
+        let region = analyzer.create_borrow("x", false);
+
+        analyzer.add_live_at(region);
+        let errors = analyzer.solve();
+        // Region is alive at depth >0, so no error
+        assert!(errors.is_empty(), "Live-at should pass for alive region: {:?}", errors);
+
+        analyzer.leave_scope(scope);
+        analyzer.leave_function();
+    }
+
+    #[test]
+    fn test_v131_lifetime_checker_clean_program() {
+        let (program, parse_errors) = crate::parser::parse("fn main() -> i64 { let x = 42; x }");
+        assert!(parse_errors.is_empty());
+        let mut checker = LifetimeChecker::new();
+        let errors = checker.check(&program);
+        assert!(errors.is_empty(), "Clean program should have no lifetime errors: {:?}", errors);
+    }
+
+    #[test]
+    fn test_v131_lifetime_checker_multiple_functions() {
+        let (program, parse_errors) = crate::parser::parse(
+            "fn foo(x: i64) -> i64 { x + 1 }\nfn main() -> i64 { foo(42) }"
+        );
+        assert!(parse_errors.is_empty());
+        let mut checker = LifetimeChecker::new();
+        let errors = checker.check(&program);
+        assert!(errors.is_empty(), "Multiple functions should be fine: {:?}", errors);
     }
 }

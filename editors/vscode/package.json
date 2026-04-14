@@ -1,0 +1,28 @@
+{
+  "name": "vitalis",
+  "displayName": "Vitalis Language",
+  "description": "Language support for Vitalis (.sl files) via the Vitalis LSP server",
+  "version": "0.1.0",
+  "publisher": "ModernOps888",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ModernOps888/vitalis"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:vitalis"],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "vitalis",
+        "aliases": ["Vitalis", "vitalis"],
+        "extensions": [".sl"],
+        "configuration": "./language-configuration.json"
+      }
+    ]
+  }
+}

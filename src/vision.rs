@@ -8,7 +8,6 @@
 //! - **Data augmentation**: Flip, rotate, resize, crop, color jitter
 //! - **Diffusion primitives**: Noise schedule, denoising step
 
-use std::collections::HashMap;
 
 // ── Image Tensor ────────────────────────────────────────────────────
 

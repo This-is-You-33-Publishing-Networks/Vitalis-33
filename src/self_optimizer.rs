@@ -2,9 +2,10 @@
 //!
 //! Provides reinforcement learning for compiler optimization pass ordering,
 //! cost models for performance prediction, auto-tuning via Bayesian optimization,
-//! and adaptive compilation strategies.
+//! adaptive compilation strategies, and real IR analysis / pass dispatch.
 
 use std::collections::HashMap;
+use crate::ir::{IrModule, Inst, BlockId};
 
 // ── Optimization Pass ───────────────────────────────────────────────────
 
@@ -456,6 +457,214 @@ impl Default for AdaptiveCompiler {
     fn default() -> Self { Self::new() }
 }
 
+// ── Real IR Analysis & Pass Dispatch ────────────────────────────────────
+
+/// Extract ProgramFeatures from a real IrModule by analyzing its IR.
+pub fn extract_features(module: &IrModule) -> ProgramFeatures {
+    let mut features = ProgramFeatures::default();
+
+    for func in &module.functions {
+        features.num_basic_blocks += func.blocks.len();
+        for block in &func.blocks {
+            features.num_instructions += block.insts.len();
+            for inst in &block.insts {
+                match inst {
+                    Inst::Branch { .. } => features.num_branches += 1,
+                    Inst::Jump { .. } => {} // unconditional — not a branch decision
+                    Inst::Call { .. } => features.num_calls += 1,
+                    Inst::Load { .. } | Inst::Store { .. }
+                    | Inst::Alloca { .. } => features.num_memory_ops += 1,
+                    Inst::BinOp { .. } | Inst::UnOp { .. } => features.num_arithmetic_ops += 1,
+                    Inst::Phi { .. } => features.num_phi_nodes += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Estimate register pressure: max live values across any block
+    for func in &module.functions {
+        for block in &func.blocks {
+            let mut defs = 0usize;
+            for inst in &block.insts {
+                // Count instructions that define a new value
+                match inst {
+                    Inst::IConst { .. } | Inst::FConst { .. } | Inst::BConst { .. }
+                    | Inst::StrConst { .. } | Inst::BinOp { .. } | Inst::UnOp { .. }
+                    | Inst::ICmp { .. } | Inst::FCmp { .. } | Inst::Phi { .. }
+                    | Inst::Copy { .. } | Inst::Load { .. } | Inst::Alloca { .. }
+                    | Inst::Call { .. } | Inst::ArrayAlloc { .. } | Inst::ArrayGet { .. }
+                    | Inst::ArrayLen { .. } | Inst::StructAlloc { .. }
+                    | Inst::FieldGet { .. } | Inst::ClosureAlloc { .. } => {
+                        defs += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if defs > features.estimated_register_pressure {
+                features.estimated_register_pressure = defs;
+            }
+        }
+    }
+
+    // Simple loop detection: count back-edges (branch/jump to earlier block)
+    for func in &module.functions {
+        let block_ids: Vec<BlockId> = func.blocks.iter().map(|b| b.id).collect();
+        for (idx, block) in func.blocks.iter().enumerate() {
+            for inst in &block.insts {
+                let targets: Vec<BlockId> = match inst {
+                    Inst::Jump { target } => vec![*target],
+                    Inst::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+                    _ => vec![],
+                };
+                for target in targets {
+                    // Back-edge: target appears before current block
+                    if let Some(target_idx) = block_ids.iter().position(|&b| b == target) {
+                        if target_idx <= idx {
+                            features.num_loops += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    features
+}
+
+/// Apply a single optimization pass to an IrModule, returning number of changes.
+/// Dispatches to real optimizer.rs functions for implemented passes.
+pub fn apply_pass(pass: OptPass, module: &mut IrModule) -> u32 {
+    let mut changes = 0u32;
+    match pass {
+        OptPass::ConstantFolding => {
+            for func in &mut module.functions {
+                changes += crate::optimizer::constant_fold(func);
+            }
+        }
+        OptPass::DeadCodeElimination => {
+            for func in &mut module.functions {
+                changes += crate::optimizer::dead_code_eliminate(func);
+            }
+        }
+        OptPass::CommonSubexprElimination => {
+            for func in &mut module.functions {
+                changes += crate::optimizer::cse(func);
+            }
+        }
+        OptPass::StrengthReduction => {
+            for func in &mut module.functions {
+                changes += crate::optimizer::strength_reduce(func);
+            }
+        }
+        // Passes without real implementations yet — no-op
+        _ => {}
+    }
+    changes
+}
+
+/// Apply a sequence of passes and return total changes per pass.
+pub fn apply_pass_sequence(passes: &[OptPass], module: &mut IrModule) -> Vec<(OptPass, u32)> {
+    passes.iter().map(|&pass| {
+        let changes = apply_pass(pass, module);
+        (pass, changes)
+    }).collect()
+}
+
+/// Measure the improvement ratio between features before and after optimization.
+/// Returns a score in [0, 1] where higher = more improvement.
+pub fn measure_improvement(before: &ProgramFeatures, after: &ProgramFeatures) -> f64 {
+    if before.num_instructions == 0 {
+        return 0.0;
+    }
+    // Reduction in instruction count (primary metric)
+    let inst_reduction = if after.num_instructions < before.num_instructions {
+        (before.num_instructions - after.num_instructions) as f64 / before.num_instructions as f64
+    } else {
+        0.0
+    };
+    // Reduction in register pressure
+    let reg_reduction = if before.estimated_register_pressure > 0
+        && after.estimated_register_pressure < before.estimated_register_pressure
+    {
+        (before.estimated_register_pressure - after.estimated_register_pressure) as f64
+            / before.estimated_register_pressure as f64
+    } else {
+        0.0
+    };
+    // Weighted: 70% instruction reduction + 30% register pressure reduction
+    (inst_reduction * 0.7 + reg_reduction * 0.3).min(1.0)
+}
+
+/// Run the RL agent to find an optimized pass ordering for a module.
+/// Trains the agent over `episodes` using feature-based simulation
+/// and returns the best ordering found.
+pub fn rl_optimize(module: &IrModule, episodes: usize, seed: u64) -> Vec<OptPass> {
+    let implemented = [
+        OptPass::ConstantFolding,
+        OptPass::DeadCodeElimination,
+        OptPass::CommonSubexprElimination,
+        OptPass::StrengthReduction,
+    ];
+    let num_passes = implemented.len();
+    let mut agent = PassOrderingAgent::new(num_passes, 0.1, 0.9, 0.3);
+
+    let features = extract_features(module);
+    let initial_state = vec![features.num_instructions, features.num_basic_blocks];
+
+    for ep in 0..episodes {
+        let mut state = initial_state.clone();
+        let mut available: Vec<usize> = (0..num_passes).collect();
+
+        // Simulate pass ordering using feature estimates (no module mutation)
+        let mut simulated_insts = features.num_instructions;
+        let simulated_blocks = features.num_basic_blocks;
+
+        for _ in 0..num_passes {
+            if available.is_empty() { break; }
+            let action = agent.select_action(&state, &available, seed.wrapping_add(ep as u64));
+
+            // Estimate reward based on pass type and current features
+            let reward = match implemented[action] {
+                OptPass::ConstantFolding => {
+                    let r = (features.num_arithmetic_ops as f64 * 0.1).min(0.5);
+                    simulated_insts = simulated_insts.saturating_sub((r * simulated_insts as f64) as usize);
+                    r
+                }
+                OptPass::DeadCodeElimination => {
+                    let r = 0.15_f64.min(simulated_insts as f64 * 0.01);
+                    simulated_insts = simulated_insts.saturating_sub(1);
+                    r
+                }
+                OptPass::CommonSubexprElimination => {
+                    let r = (features.num_arithmetic_ops as f64 * 0.05).min(0.3);
+                    simulated_insts = simulated_insts.saturating_sub((r * simulated_insts as f64) as usize);
+                    r
+                }
+                OptPass::StrengthReduction => {
+                    let r = (features.num_arithmetic_ops as f64 * 0.08).min(0.4);
+                    simulated_insts = simulated_insts.saturating_sub((r * simulated_insts as f64) as usize);
+                    r
+                }
+                _ => 0.0,
+            };
+
+            let next_state = vec![simulated_insts, simulated_blocks];
+            agent.update(&state, action, reward, &next_state);
+            state = next_state;
+            available.retain(|&a| a != action);
+        }
+
+        agent.decay_epsilon(0.01, 0.95);
+    }
+
+    // Get best ordering from trained agent
+    let ordering_indices = agent.best_ordering(&initial_state, num_passes);
+    ordering_indices.iter()
+        .filter_map(|&i| implemented.get(i).copied())
+        .collect()
+}
+
 // ── FFI Interface ───────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -641,5 +850,271 @@ mod tests {
         for pass in OptPass::all() {
             assert!(!pass.name().is_empty());
         }
+    }
+
+    // ── v68: Real pass wiring tests ──────────────────────────────────────
+
+    #[test]
+    fn test_extract_features_empty_module() {
+        let module = crate::ir::IrModule::new();
+        let features = super::extract_features(&module);
+        assert_eq!(features.num_instructions, 0);
+        assert_eq!(features.num_basic_blocks, 0);
+    }
+
+    #[test]
+    fn test_extract_features_with_ir() {
+        use crate::ir::*;
+        let mut module = IrModule::new();
+        let mut func = IrFunction {
+            name: "test".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![],
+            entry: BlockId(0),
+        };
+        let mut block = BasicBlock::new(BlockId(0));
+        block.insts.push(Inst::IConst { result: Value(0), value: 10, ty: IrType::I64 });
+        block.insts.push(Inst::IConst { result: Value(1), value: 20, ty: IrType::I64 });
+        block.insts.push(Inst::BinOp {
+            result: Value(2), op: IrBinOp::Add, lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+        });
+        block.insts.push(Inst::Return { value: Some(Value(2)) });
+        func.blocks.push(block);
+        module.functions.push(func);
+
+        let features = super::extract_features(&module);
+        assert_eq!(features.num_instructions, 4);
+        assert_eq!(features.num_basic_blocks, 1);
+        assert_eq!(features.num_arithmetic_ops, 1);
+        assert!(features.estimated_register_pressure >= 3);
+    }
+
+    #[test]
+    fn test_apply_pass_constant_folding() {
+        use crate::ir::*;
+        let mut module = IrModule::new();
+        let mut func = IrFunction {
+            name: "fold_me".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![],
+            entry: BlockId(0),
+        };
+        let mut block = BasicBlock::new(BlockId(0));
+        block.insts.push(Inst::IConst { result: Value(0), value: 3, ty: IrType::I64 });
+        block.insts.push(Inst::IConst { result: Value(1), value: 7, ty: IrType::I64 });
+        block.insts.push(Inst::BinOp {
+            result: Value(2), op: IrBinOp::Add, lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+        });
+        block.insts.push(Inst::Return { value: Some(Value(2)) });
+        func.blocks.push(block);
+        module.functions.push(func);
+
+        let changes = super::apply_pass(OptPass::ConstantFolding, &mut module);
+        assert!(changes > 0, "constant folding should fold 3+7");
+        // The BinOp should now be an IConst with value 10
+        let inst = &module.functions[0].blocks[0].insts[2];
+        match inst {
+            Inst::IConst { value: 10, .. } => {} // correct
+            other => panic!("Expected IConst(10), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_apply_pass_dce() {
+        use crate::ir::*;
+        let mut module = IrModule::new();
+        let mut func = IrFunction {
+            name: "dce_me".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![],
+            entry: BlockId(0),
+        };
+        let mut block = BasicBlock::new(BlockId(0));
+        // v0 = 42 (used in return)
+        block.insts.push(Inst::IConst { result: Value(0), value: 42, ty: IrType::I64 });
+        // v1 = 99 (dead — never used)
+        block.insts.push(Inst::IConst { result: Value(1), value: 99, ty: IrType::I64 });
+        block.insts.push(Inst::Return { value: Some(Value(0)) });
+        func.blocks.push(block);
+        module.functions.push(func);
+
+        let changes = super::apply_pass(OptPass::DeadCodeElimination, &mut module);
+        assert_eq!(changes, 1, "DCE should remove the unused IConst(99)");
+        assert_eq!(module.functions[0].blocks[0].insts.len(), 2); // IConst(42) + Return
+    }
+
+    #[test]
+    fn test_apply_pass_strength_reduce() {
+        use crate::ir::*;
+        let mut module = IrModule::new();
+        let mut func = IrFunction {
+            name: "sr_me".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![],
+            entry: BlockId(0),
+        };
+        let mut block = BasicBlock::new(BlockId(0));
+        block.insts.push(Inst::IConst { result: Value(0), value: 5, ty: IrType::I64 });
+        block.insts.push(Inst::IConst { result: Value(1), value: 1, ty: IrType::I64 });
+        // 5 * 1 should be strength-reduced to Copy
+        block.insts.push(Inst::BinOp {
+            result: Value(2), op: IrBinOp::Mul, lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+        });
+        block.insts.push(Inst::Return { value: Some(Value(2)) });
+        func.blocks.push(block);
+        module.functions.push(func);
+
+        let changes = super::apply_pass(OptPass::StrengthReduction, &mut module);
+        assert!(changes > 0, "x * 1 should be reduced to copy");
+    }
+
+    #[test]
+    fn test_apply_pass_cse() {
+        use crate::ir::*;
+        let mut module = IrModule::new();
+        let mut func = IrFunction {
+            name: "cse_me".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![],
+            entry: BlockId(0),
+        };
+        let mut block = BasicBlock::new(BlockId(0));
+        block.insts.push(Inst::IConst { result: Value(0), value: 3, ty: IrType::I64 });
+        block.insts.push(Inst::IConst { result: Value(1), value: 4, ty: IrType::I64 });
+        // Same operation twice: 3 + 4
+        block.insts.push(Inst::BinOp {
+            result: Value(2), op: IrBinOp::Add, lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+        });
+        block.insts.push(Inst::BinOp {
+            result: Value(3), op: IrBinOp::Add, lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+        });
+        block.insts.push(Inst::Return { value: Some(Value(3)) });
+        func.blocks.push(block);
+        module.functions.push(func);
+
+        let changes = super::apply_pass(OptPass::CommonSubexprElimination, &mut module);
+        assert_eq!(changes, 1, "CSE should eliminate duplicate add");
+    }
+
+    #[test]
+    fn test_apply_pass_sequence() {
+        use crate::ir::*;
+        let mut module = IrModule::new();
+        let mut func = IrFunction {
+            name: "seq_opt".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![],
+            entry: BlockId(0),
+        };
+        let mut block = BasicBlock::new(BlockId(0));
+        block.insts.push(Inst::IConst { result: Value(0), value: 5, ty: IrType::I64 });
+        block.insts.push(Inst::IConst { result: Value(1), value: 0, ty: IrType::I64 });
+        // 5 + 0 → strength reduce to copy of v0
+        block.insts.push(Inst::BinOp {
+            result: Value(2), op: IrBinOp::Add, lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+        });
+        block.insts.push(Inst::Return { value: Some(Value(2)) });
+        func.blocks.push(block);
+        module.functions.push(func);
+
+        let results = super::apply_pass_sequence(
+            &[OptPass::StrengthReduction, OptPass::DeadCodeElimination],
+            &mut module,
+        );
+        assert_eq!(results.len(), 2);
+        // Strength reduction changes x+0 to copy
+        assert!(results[0].1 > 0);
+    }
+
+    #[test]
+    fn test_measure_improvement() {
+        let before = ProgramFeatures {
+            num_instructions: 100,
+            estimated_register_pressure: 20,
+            ..Default::default()
+        };
+        let after = ProgramFeatures {
+            num_instructions: 70,
+            estimated_register_pressure: 15,
+            ..Default::default()
+        };
+        let score = super::measure_improvement(&before, &after);
+        // 30% instruction reduction * 0.7 + 25% reg reduction * 0.3 = 0.21 + 0.075 = 0.285
+        assert!(score > 0.2 && score < 0.4, "score={}", score);
+    }
+
+    #[test]
+    fn test_measure_improvement_no_change() {
+        let features = ProgramFeatures {
+            num_instructions: 50,
+            ..Default::default()
+        };
+        assert_eq!(super::measure_improvement(&features, &features), 0.0);
+    }
+
+    #[test]
+    fn test_rl_optimize_basic() {
+        use crate::ir::*;
+        let mut module = IrModule::new();
+        let mut func = IrFunction {
+            name: "rl_test".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![],
+            entry: BlockId(0),
+        };
+        let mut block = BasicBlock::new(BlockId(0));
+        block.insts.push(Inst::IConst { result: Value(0), value: 10, ty: IrType::I64 });
+        block.insts.push(Inst::IConst { result: Value(1), value: 0, ty: IrType::I64 });
+        block.insts.push(Inst::BinOp {
+            result: Value(2), op: IrBinOp::Add, lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+        });
+        block.insts.push(Inst::Return { value: Some(Value(2)) });
+        func.blocks.push(block);
+        module.functions.push(func);
+
+        let ordering = super::rl_optimize(&module, 5, 42);
+        // Should return some ordering of the 4 implemented passes
+        assert!(!ordering.is_empty());
+        assert!(ordering.len() <= 4);
+    }
+
+    #[test]
+    fn test_extract_features_branches_and_loops() {
+        use crate::ir::*;
+        let mut module = IrModule::new();
+        let mut func = IrFunction {
+            name: "loop_fn".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![],
+            entry: BlockId(0),
+        };
+        // Block 0: entry
+        let mut b0 = BasicBlock::new(BlockId(0));
+        b0.insts.push(Inst::IConst { result: Value(0), value: 1, ty: IrType::Bool });
+        b0.insts.push(Inst::Branch { cond: Value(0), then_bb: BlockId(1), else_bb: BlockId(2) });
+        func.blocks.push(b0);
+        // Block 1: loop body — jumps back to block 0 (back-edge)
+        let mut b1 = BasicBlock::new(BlockId(1));
+        b1.insts.push(Inst::Jump { target: BlockId(0) });
+        func.blocks.push(b1);
+        // Block 2: exit
+        let mut b2 = BasicBlock::new(BlockId(2));
+        b2.insts.push(Inst::IConst { result: Value(1), value: 0, ty: IrType::I64 });
+        b2.insts.push(Inst::Return { value: Some(Value(1)) });
+        func.blocks.push(b2);
+        module.functions.push(func);
+
+        let features = super::extract_features(&module);
+        assert_eq!(features.num_basic_blocks, 3);
+        assert_eq!(features.num_branches, 1);
+        assert!(features.num_loops >= 1, "should detect back-edge as loop");
     }
 }

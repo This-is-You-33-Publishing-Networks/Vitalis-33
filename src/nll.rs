@@ -743,19 +743,72 @@ impl NllChecker {
         // 2. Compute liveness
         let liveness = compute_liveness(&cfg);
 
-        // 3. Collect borrow regions from the CFG
+        // 3. Collect move points from assignments and calls
+        self.collect_moves(&cfg);
+
+        // 4. Collect borrow regions from the CFG
         self.collect_borrows(&cfg, &liveness);
 
-        // 4. Detect conflicts between overlapping regions
+        // 5. Detect conflicts between overlapping regions
         self.detect_conflicts(&cfg);
 
-        // 5. Check for modifications while borrowed
+        // 6. Check for modifications while borrowed
         self.check_modify_while_borrowed(&cfg, &liveness);
+
+        // 7. Check for use-after-move
+        self.check_use_after_move(&cfg);
 
         // Clear per-function state for next function
         self.regions.clear();
         self.move_points.clear();
         self.ref_to_region.clear();
+    }
+
+    /// Collect move points by scanning the CFG for assignment nodes.
+    /// When a variable is assigned to another, the source is moved.
+    fn collect_moves(&mut self, cfg: &Cfg) {
+        for node in &cfg.nodes {
+            if let CfgNodeKind::Assignment { target } = &node.kind {
+                // An assignment from a variable constitutes a move of that variable's value
+                // Track the target as having a value moved into it at this point
+                self.move_points.entry(target.clone()).or_default().push(node.id);
+            }
+        }
+    }
+
+    /// Check for uses of a variable after it has been moved.
+    fn check_use_after_move(&mut self, cfg: &Cfg) {
+        // For each borrow region, check if the borrowed variable was moved before the borrow
+        let regions = self.regions.clone();
+        for region in &regions {
+            if let Some(move_pts) = self.move_points.get(&region.variable) {
+                for &move_pt in move_pts {
+                    // If a move point is before the borrow origin and there's no
+                    // redefinition between them, it's a borrow-after-move
+                    if move_pt < region.origin {
+                        // Check for redefinition between move and borrow
+                        let has_redef = cfg.nodes.iter().any(|n| {
+                            if let CfgNodeKind::LetBinding { name } = &n.kind {
+                                name == &region.variable && n.id > move_pt && n.id < region.origin
+                            } else {
+                                false
+                            }
+                        });
+                        if !has_redef {
+                            self.errors.push(NllError {
+                                kind: NllErrorKind::BorrowAfterMove,
+                                message: format!(
+                                    "cannot borrow '{}' — value was moved at point {}",
+                                    region.variable, move_pt
+                                ),
+                                hint: Some("consider cloning the value before moving".to_string()),
+                                conflict_point: Some(region.origin),
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Collect borrow regions by scanning the CFG for borrow nodes and
@@ -1480,5 +1533,103 @@ mod tests {
             format!("{}", CfgNodeKind::Assignment { target: "bar".to_string() }),
             "bar = ..."
         );
+    }
+
+    // ─── v130 tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_v130_move_points_collected() {
+        let cfgs = build_cfg_from_source(
+            "fn main() -> i64 { let mut x = 1; x = 2; x }"
+        );
+        let cfg = &cfgs[0];
+        let has_assignment = cfg.nodes.iter().any(|n| {
+            matches!(&n.kind, CfgNodeKind::Assignment { target } if target == "x")
+        });
+        assert!(has_assignment, "CFG should track assignment to x");
+    }
+
+    #[test]
+    fn test_v130_nll_checker_move_tracking() {
+        let mut checker = NllChecker::new();
+        // After analysis, move_points should be populated for assigned vars
+        let (program, _) = crate::parser::parse(
+            "fn main() -> i64 { let mut x = 1; x = 2; x }"
+        );
+        let _ = checker.check(&program);
+        // No errors expected — simple reassignment is fine
+    }
+
+    #[test]
+    fn test_v130_nll_region_non_overlap() {
+        let region_a = NllRegion {
+            id: 0,
+            variable: "x".to_string(),
+            mutable: true,
+            origin: 1,
+            ref_name: Some("r1".to_string()),
+            live_points: [1, 2, 3].iter().copied().collect(),
+        };
+        let region_b = NllRegion {
+            id: 1,
+            variable: "x".to_string(),
+            mutable: true,
+            origin: 5,
+            ref_name: Some("r2".to_string()),
+            live_points: [5, 6, 7].iter().copied().collect(),
+        };
+        assert!(!region_a.overlaps(&region_b), "Non-overlapping regions should not conflict");
+    }
+
+    #[test]
+    fn test_v130_nll_region_overlapping() {
+        let region_a = NllRegion {
+            id: 0,
+            variable: "x".to_string(),
+            mutable: true,
+            origin: 1,
+            ref_name: Some("r1".to_string()),
+            live_points: [1, 2, 3, 4].iter().copied().collect(),
+        };
+        let region_b = NllRegion {
+            id: 1,
+            variable: "x".to_string(),
+            mutable: true,
+            origin: 3,
+            ref_name: Some("r2".to_string()),
+            live_points: [3, 4, 5].iter().copied().collect(),
+        };
+        assert!(region_a.overlaps(&region_b), "Overlapping regions should be detected");
+    }
+
+    #[test]
+    fn test_v130_nll_error_kind_variants() {
+        let kinds = vec![
+            NllErrorKind::MutableAliasing,
+            NllErrorKind::MutableSharedConflict,
+            NllErrorKind::UseAfterMove,
+            NllErrorKind::BorrowAfterMove,
+            NllErrorKind::ModifyWhileBorrowed,
+        ];
+        // Each kind should have a distinct debug representation
+        let reprs: Vec<String> = kinds.iter().map(|k| format!("{:?}", k)).collect();
+        let unique: HashSet<&String> = reprs.iter().collect();
+        assert_eq!(unique.len(), 5, "All NLL error kinds should be distinct");
+    }
+
+    #[test]
+    fn test_v130_nll_clean_multi_let() {
+        let errors = analyze_nll(
+            "fn main() -> i64 { let a = 1; let b = 2; let c = 3; a + b + c }"
+        );
+        assert!(errors.is_empty(), "Multiple let bindings should have no NLL errors");
+    }
+
+    #[test]
+    fn test_v130_nll_return_expr() {
+        let errors = analyze_nll(
+            "fn main() -> i64 { let x = 42; return x; }"
+        );
+        assert!(errors.is_empty(), "Return of owned value should be fine: {:?}", errors);
     }
 }

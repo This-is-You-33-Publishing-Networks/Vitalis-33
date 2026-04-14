@@ -343,7 +343,7 @@ impl TieredJit {
 
                 // Add speculative optimizations based on profile.
                 if let Some(profile) = self.profiles.get(name) {
-                    for (site, obs) in &profile.type_observations {
+                    for (_site, obs) in &profile.type_observations {
                         if let TypeObservation::Monomorphic(ty) = obs {
                             let guard_id = self.next_guard_id;
                             self.next_guard_id += 1;

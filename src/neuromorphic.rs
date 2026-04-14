@@ -565,7 +565,7 @@ pub unsafe extern "C" fn vitalis_neuro_neat_compatibility(
 
     let max1 = (0..n1).map(|i| g1[i * 3] as i64).max().unwrap_or(0);
     let max2 = (0..n2).map(|i| g2[i * 3] as i64).max().unwrap_or(0);
-    let max_innov = max1.max(max2);
+    let _max_innov = max1.max(max2);
 
     let mut excess = 0u32;
     let mut disjoint = 0u32;

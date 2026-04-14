@@ -8,7 +8,6 @@
 //! - **Loop transformations**: Tiling, skewing, interchange, fusion, fission
 //! - **Auto-parallelization**: Independence detection for parallel execution
 
-use std::collections::HashMap;
 
 // ── Integer Sets (Polyhedra) ─────────────────────────────────────────
 
@@ -324,7 +323,7 @@ pub struct TransformResult {
 }
 
 /// Apply tiling to a schedule map.
-pub fn apply_tiling(schedule: &AffineMap, depth: usize, tile_size: usize) -> AffineMap {
+pub fn apply_tiling(schedule: &AffineMap, depth: usize, _tile_size: usize) -> AffineMap {
     let mut new_matrix = schedule.matrix.clone();
     let mut new_trans = schedule.translation.clone();
 

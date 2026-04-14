@@ -8,7 +8,6 @@
 //! - **Trace diffing**: Compare two traces to find divergence
 //! - **Snapshot compression**: Delta-compressed memory snapshots
 
-use std::collections::HashMap;
 
 // ── Trace Events ────────────────────────────────────────────────────
 

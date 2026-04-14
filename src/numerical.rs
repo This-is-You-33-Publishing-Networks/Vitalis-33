@@ -17,8 +17,6 @@
 //! - Eigenvalue estimation (power iteration)
 //! - Cholesky decomposition
 
-use std::ffi::CString;
-use std::os::raw::c_char;
 
 // ─── Matrix Multiply ─────────────────────────────────────────────────
 

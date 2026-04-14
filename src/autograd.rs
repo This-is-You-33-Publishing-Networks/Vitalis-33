@@ -606,8 +606,8 @@ pub extern "C" fn vitalis_autograd_variable(data_ptr: *const f64, count: i64, re
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_autograd_add(a: i64, b: i64) -> i64 {
     with_vars(|vars| {
-        let va = vars.get(&a).unwrap().clone();
-        let vb = vars.get(&b).unwrap();
+        let va = match vars.get(&a) { Some(v) => v.clone(), None => return -1 };
+        let vb = match vars.get(&b) { Some(v) => v, None => return -1 };
         let result = va.add(vb);
         let id = next_var_id();
         vars.insert(id, result);
@@ -618,8 +618,8 @@ pub extern "C" fn vitalis_autograd_add(a: i64, b: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_autograd_mul(a: i64, b: i64) -> i64 {
     with_vars(|vars| {
-        let va = vars.get(&a).unwrap().clone();
-        let vb = vars.get(&b).unwrap();
+        let va = match vars.get(&a) { Some(v) => v.clone(), None => return -1 };
+        let vb = match vars.get(&b) { Some(v) => v, None => return -1 };
         let result = va.mul(vb);
         let id = next_var_id();
         vars.insert(id, result);
@@ -630,15 +630,16 @@ pub extern "C" fn vitalis_autograd_mul(a: i64, b: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_autograd_backward(id: i64) {
     with_vars(|vars| {
-        let v = vars.get(&id).unwrap();
-        v.backward();
+        if let Some(v) = vars.get(&id) {
+            v.backward();
+        }
     });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vitalis_autograd_get_grad(id: i64, out_ptr: *mut f64, max_count: i64) -> i64 {
     with_vars(|vars| {
-        let v = vars.get(&id).unwrap();
+        let v = match vars.get(&id) { Some(v) => v, None => return 0 };
         let grad = v.grad();
         let count = grad.len().min(max_count as usize);
         unsafe {
@@ -669,6 +670,64 @@ pub extern "C" fn vitalis_grad_clip_norm(grad_ptr: *mut f64, count: i64, max_nor
 pub extern "C" fn vitalis_grad_clip_value(grad_ptr: *mut f64, count: i64, clip_val: f64) {
     let grad = unsafe { std::slice::from_raw_parts_mut(grad_ptr, count as usize) };
     clip_grad_value(grad, clip_val);
+}
+
+// ── v116: Simplified autograd FFI (JIT-callable from .sl) ───────────────
+
+/// Create a scalar autograd variable with requires_grad=true.
+/// value_bits is f64 reinterpreted as i64.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_autograd_scalar(value_bits: i64) -> i64 {
+    let val = f64::from_bits(value_bits as u64);
+    let v = Variable::new(vec![val], vec![1], true);
+    let id = next_var_id();
+    with_vars(|vars| vars.insert(id, v));
+    id
+}
+
+/// Get the scalar value of a variable (index 0).
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_autograd_value(id: i64) -> f64 {
+    with_vars(|vars| {
+        vars.get(&id)
+            .map(|v| v.data[0])
+            .unwrap_or(0.0)
+    })
+}
+
+/// Get the scalar gradient of a variable (index 0).
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_autograd_grad_scalar(id: i64) -> f64 {
+    with_vars(|vars| {
+        vars.get(&id)
+            .map(|v| {
+                let g = v.grad();
+                if g.is_empty() { 0.0 } else { g[0] }
+            })
+            .unwrap_or(0.0)
+    })
+}
+
+/// Get number of elements in a variable.
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_autograd_numel(id: i64) -> i64 {
+    with_vars(|vars| {
+        vars.get(&id)
+            .map(|v| v.data.len() as i64)
+            .unwrap_or(0)
+    })
+}
+
+/// Sum a variable to produce a scalar (differentiable).
+#[unsafe(no_mangle)]
+pub extern "C" fn vitalis_autograd_sum(id: i64) -> i64 {
+    with_vars(|vars| {
+        let v = match vars.get(&id) { Some(v) => v.clone(), None => return -1 };
+        let result = v.sum();
+        let rid = next_var_id();
+        vars.insert(rid, result);
+        rid
+    })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -913,5 +972,91 @@ mod tests {
         b.backward();
         let ga = a.grad();
         assert!((ga[0] - 0.5).abs() < 1e-10); // silu'(0) = sigmoid(0) + 0*sigmoid'(0) = 0.5
+    }
+
+    // ── v116: FFI + JIT integration tests ────────────────────────────
+
+    #[test]
+    fn test_v116_ffi_scalar_creation() {
+        vitalis_autograd_clear();
+        let val: f64 = 5.0;
+        let id = vitalis_autograd_scalar(val.to_bits() as i64);
+        assert!(id > 0);
+        let got = vitalis_autograd_value(id);
+        assert!((got - 5.0).abs() < 1e-10);
+        vitalis_autograd_clear();
+    }
+
+    #[test]
+    fn test_v116_ffi_add_and_numel() {
+        vitalis_autograd_clear();
+        let a = vitalis_autograd_scalar(3.0_f64.to_bits() as i64);
+        let b = vitalis_autograd_scalar(4.0_f64.to_bits() as i64);
+        let c = vitalis_autograd_add(a, b);
+        assert_eq!(vitalis_autograd_numel(c), 1);
+        // Value check: 3.0 + 4.0 = 7.0
+        let val = vitalis_autograd_value(c);
+        assert!((val - 7.0).abs() < 1e-6, "expected 7.0, got {val}");
+        vitalis_autograd_clear();
+    }
+
+    #[test]
+    fn test_v116_ffi_mul_and_backward() {
+        vitalis_autograd_clear();
+        let a = vitalis_autograd_scalar(3.0_f64.to_bits() as i64);
+        let b = vitalis_autograd_scalar(4.0_f64.to_bits() as i64);
+        let c = vitalis_autograd_mul(a, b);
+        let val = vitalis_autograd_value(c);
+        assert!((val - 12.0).abs() < 1e-10);
+        vitalis_autograd_backward(c);
+        let ga = vitalis_autograd_grad_scalar(a);
+        assert!((ga - 4.0).abs() < 1e-10); // d(a*b)/da = b = 4
+        vitalis_autograd_clear();
+    }
+
+    #[test]
+    fn test_v116_ffi_sum() {
+        vitalis_autograd_clear();
+        let a = vitalis_autograd_scalar(2.0_f64.to_bits() as i64);
+        let b = vitalis_autograd_scalar(3.0_f64.to_bits() as i64);
+        let c = vitalis_autograd_add(a, b);
+        let s = vitalis_autograd_sum(c);
+        let val = vitalis_autograd_value(s);
+        assert!((val - 5.0).abs() < 1e-10);
+        vitalis_autograd_clear();
+    }
+
+    #[test]
+    fn test_v116_jit_autograd_add() {
+        let source = r#"
+fn main() -> i64 {
+    autograd_clear();
+    let a: i64 = autograd_scalar(0);
+    let b: i64 = autograd_scalar(0);
+    let c: i64 = autograd_add(a, b);
+    let n: i64 = autograd_numel(c);
+    autograd_clear();
+    n
+}
+"#;
+        let result = crate::codegen::compile_and_run(source).unwrap();
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn test_v116_jit_autograd_mul_numel() {
+        let source = r#"
+fn main() -> i64 {
+    autograd_clear();
+    let a: i64 = autograd_scalar(0);
+    let b: i64 = autograd_scalar(0);
+    let c: i64 = autograd_mul(a, b);
+    let n: i64 = autograd_numel(c);
+    autograd_clear();
+    n
+}
+"#;
+        let result = crate::codegen::compile_and_run(source).unwrap();
+        assert_eq!(result, 1);
     }
 }

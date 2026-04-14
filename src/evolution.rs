@@ -542,6 +542,324 @@ where
     GLOBAL_REGISTRY.with(|reg| f(&mut reg.borrow_mut()))
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+//  v66: Built-in Mutation Strategies
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Categories of source-level mutations that can be applied to function bodies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MutationKind {
+    /// Swap an arithmetic operator for another (+ ↔ -, * ↔ /)
+    SwapOperator,
+    /// Replace an integer literal with a nearby value
+    PerturbConstant,
+    /// Duplicate a statement
+    DuplicateStatement,
+    /// Remove a statement (if safe)
+    RemoveStatement,
+    /// Swap two adjacent statements
+    SwapStatements,
+    /// Negate a boolean condition
+    NegateCondition,
+}
+
+/// A concrete mutation applied to source code, with undo information.
+#[derive(Debug, Clone)]
+pub struct Mutation {
+    pub kind: MutationKind,
+    pub description: String,
+    pub original_fragment: String,
+    pub mutated_fragment: String,
+}
+
+/// Deterministic PRNG for reproducible mutations (xorshift64).
+pub struct MutationRng {
+    state: u64,
+}
+
+impl MutationRng {
+    pub fn new(seed: u64) -> Self {
+        Self { state: if seed == 0 { 0xDEADBEEF } else { seed } }
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    pub fn next_usize(&mut self, bound: usize) -> usize {
+        if bound == 0 { return 0; }
+        (self.next_u64() % bound as u64) as usize
+    }
+
+    pub fn next_f64(&mut self) -> f64 {
+        (self.next_u64() & 0x1FFFFFFFFFFFFF) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Apply a random mutation to function source code.
+/// Returns the mutated source and a description of the mutation.
+pub fn mutate_source(source: &str, rng: &mut MutationRng) -> (String, Mutation) {
+    let strategies: &[fn(&str, &mut MutationRng) -> Option<(String, Mutation)>] = &[
+        mutate_swap_operator,
+        mutate_perturb_constant,
+        mutate_swap_statements,
+        mutate_negate_condition,
+    ];
+
+    // Try each strategy in random order until one succeeds
+    let start = rng.next_usize(strategies.len());
+    for i in 0..strategies.len() {
+        let idx = (start + i) % strategies.len();
+        if let Some(result) = strategies[idx](source, rng) {
+            return result;
+        }
+    }
+
+    // Fallback: identity mutation
+    (source.to_string(), Mutation {
+        kind: MutationKind::PerturbConstant,
+        description: "no mutation applied (source too simple)".to_string(),
+        original_fragment: String::new(),
+        mutated_fragment: String::new(),
+    })
+}
+
+/// Swap an arithmetic operator: + ↔ -, * ↔ /
+fn mutate_swap_operator(source: &str, rng: &mut MutationRng) -> Option<(String, Mutation)> {
+    let swaps: &[(&str, &str)] = &[
+        (" + ", " - "), (" - ", " + "),
+        (" * ", " / "), (" / ", " * "),
+        (" > ", " < "), (" < ", " > "),
+        (" >= ", " <= "), (" <= ", " >= "),
+    ];
+
+    // Find all swap-applicable positions
+    let mut candidates: Vec<(usize, &str, &str)> = Vec::new();
+    for &(from, to) in swaps {
+        let mut search_from = 0;
+        while let Some(pos) = source[search_from..].find(from) {
+            candidates.push((search_from + pos, from, to));
+            search_from += pos + from.len();
+        }
+    }
+
+    if candidates.is_empty() { return None; }
+
+    let (pos, from, to) = candidates[rng.next_usize(candidates.len())];
+    let mut result = String::with_capacity(source.len());
+    result.push_str(&source[..pos]);
+    result.push_str(to);
+    result.push_str(&source[pos + from.len()..]);
+
+    Some((result, Mutation {
+        kind: MutationKind::SwapOperator,
+        description: format!("swapped '{}' → '{}'", from.trim(), to.trim()),
+        original_fragment: from.to_string(),
+        mutated_fragment: to.to_string(),
+    }))
+}
+
+/// Perturb an integer constant by ±1..5
+fn mutate_perturb_constant(source: &str, rng: &mut MutationRng) -> Option<(String, Mutation)> {
+    // Find integer literals (sequences of digits not part of identifiers)
+    let bytes = source.as_bytes();
+    let mut candidates: Vec<(usize, usize)> = Vec::new(); // (start, end)
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            // Check not preceded by alphanumeric or underscore (part of identifier)
+            if i > 0 && (bytes[i-1].is_ascii_alphanumeric() || bytes[i-1] == b'_') {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            // Check not followed by alphanumeric or underscore
+            if i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                continue;
+            }
+            candidates.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+
+    if candidates.is_empty() { return None; }
+
+    let (start, end) = candidates[rng.next_usize(candidates.len())];
+    let num_str = &source[start..end];
+    let num: i64 = num_str.parse().ok()?;
+    let delta = (rng.next_usize(5) as i64 + 1) * if rng.next_u64() % 2 == 0 { 1 } else { -1 };
+    let new_num = num.saturating_add(delta);
+    let new_str = new_num.to_string();
+
+    let mut result = String::with_capacity(source.len());
+    result.push_str(&source[..start]);
+    result.push_str(&new_str);
+    result.push_str(&source[end..]);
+
+    Some((result, Mutation {
+        kind: MutationKind::PerturbConstant,
+        description: format!("perturbed {} → {} (delta {})", num, new_num, delta),
+        original_fragment: num_str.to_string(),
+        mutated_fragment: new_str,
+    }))
+}
+
+/// Swap two adjacent statements in the function body
+fn mutate_swap_statements(source: &str, rng: &mut MutationRng) -> Option<(String, Mutation)> {
+    // Split body lines (inside { ... })
+    let open = source.find('{')?;
+    let close = find_matching_brace(source, open)?;
+    let body = &source[open+1..close];
+    let lines: Vec<&str> = body.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if lines.len() < 2 { return None; }
+
+    let idx = rng.next_usize(lines.len() - 1);
+    let mut new_lines: Vec<&str> = lines.clone();
+    new_lines.swap(idx, idx + 1);
+
+    let new_body = new_lines.iter()
+        .map(|l| format!("    {}", l))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut result = String::with_capacity(source.len());
+    result.push_str(&source[..open+1]);
+    result.push('\n');
+    result.push_str(&new_body);
+    result.push('\n');
+    result.push_str(&source[close..]);
+
+    Some((result, Mutation {
+        kind: MutationKind::SwapStatements,
+        description: format!("swapped statements at lines {} and {}", idx, idx+1),
+        original_fragment: lines[idx].to_string(),
+        mutated_fragment: lines[idx+1].to_string(),
+    }))
+}
+
+/// Negate a boolean/comparison condition
+fn mutate_negate_condition(source: &str, rng: &mut MutationRng) -> Option<(String, Mutation)> {
+    let negations: &[(&str, &str)] = &[
+        ("== ", "!= "), ("!= ", "== "),
+        ("true", "false"), ("false", "true"),
+    ];
+
+    let mut candidates: Vec<(usize, &str, &str)> = Vec::new();
+    for &(from, to) in negations {
+        let mut search_from = 0;
+        while let Some(pos) = source[search_from..].find(from) {
+            candidates.push((search_from + pos, from, to));
+            search_from += pos + from.len();
+        }
+    }
+
+    if candidates.is_empty() { return None; }
+
+    let (pos, from, to) = candidates[rng.next_usize(candidates.len())];
+    let mut result = String::with_capacity(source.len());
+    result.push_str(&source[..pos]);
+    result.push_str(to);
+    result.push_str(&source[pos + from.len()..]);
+
+    Some((result, Mutation {
+        kind: MutationKind::NegateCondition,
+        description: format!("negated '{}' → '{}'", from, to),
+        original_fragment: from.to_string(),
+        mutated_fragment: to.to_string(),
+    }))
+}
+
+/// Crossover: combine body parts of two function variants.
+/// Takes the first half from parent_a and second half from parent_b.
+pub fn crossover_sources(parent_a: &str, parent_b: &str) -> Option<String> {
+    let open_a = parent_a.find('{')?;
+    let close_a = find_matching_brace(parent_a, open_a)?;
+    let open_b = parent_b.find('{')?;
+    let close_b = find_matching_brace(parent_b, open_b)?;
+
+    let body_a = &parent_a[open_a+1..close_a];
+    let body_b = &parent_b[open_b+1..close_b];
+
+    let lines_a: Vec<&str> = body_a.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines_b: Vec<&str> = body_b.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    let mid_a = lines_a.len() / 2;
+    let mid_b = lines_b.len() / 2;
+
+    let mut child_lines: Vec<&str> = Vec::new();
+    child_lines.extend_from_slice(&lines_a[..mid_a.min(lines_a.len())]);
+    child_lines.extend_from_slice(&lines_b[mid_b.min(lines_b.len())..]);
+
+    // Use parent_a's signature
+    let sig = &parent_a[..open_a];
+    let child_body = child_lines.join("\n");
+    Some(format!("{}{{\n{}\n}}", sig, child_body))
+}
+
+// Add mutation methods to the registry
+impl EvolutionRegistry {
+    /// Apply a random mutation to a registered function and evolve it.
+    pub fn mutate_and_evolve(&mut self, name: &str, seed: u64) -> Result<(u64, u64, Mutation), String> {
+        let source = self.get_source(name)
+            .ok_or_else(|| format!("function '{}' not registered", name))?
+            .to_string();
+        let mut rng = MutationRng::new(seed);
+        let (mutated, mutation) = mutate_source(&source, &mut rng);
+        let (generation, hash) = self.evolve(name, &mutated)?;
+        Ok((generation, hash, mutation))
+    }
+
+    /// Run N mutation-evaluation cycles on a function.
+    /// Returns the best fitness achieved and the generation that produced it.
+    pub fn evolve_n_cycles(&mut self, name: &str, cycles: usize, seed: u64,
+                           fitness_fn: impl Fn(i64) -> f64) -> Result<(f64, u64), String> {
+        let mut rng = MutationRng::new(seed);
+        let mut best_fitness = f64::NEG_INFINITY;
+        let mut best_gen = 0u64;
+
+        for _ in 0..cycles {
+            let cycle_seed = rng.next_u64();
+            let (generation, _hash, _mutation) = self.mutate_and_evolve(name, cycle_seed)?;
+
+            match self.evaluate_variant(name, |r| fitness_fn(r)) {
+                Ok(result) => {
+                    if let Some(fitness) = self.get_fitness(name) {
+                        if fitness > best_fitness {
+                            best_fitness = fitness;
+                            best_gen = generation;
+                        } else {
+                            // Revert to previous best if fitness declined
+                            let _ = self.rollback(name, best_gen);
+                        }
+                    }
+                    if result.error.is_some() {
+                        // Compilation failed — rollback
+                        let _ = self.rollback(name, best_gen);
+                    }
+                }
+                Err(_) => {
+                    let _ = self.rollback(name, best_gen);
+                }
+            }
+        }
+
+        Ok((best_fitness, best_gen))
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -780,5 +1098,98 @@ fn main() -> i64 {
         // Original bodies must be gone
         assert!(!assembled.contains("{ x }"), "original alpha body still present");
         assert!(!assembled.contains("x + 1"), "original beta body still present");
+    }
+
+    // ─── v66: Mutation Strategy Tests ──────────────────────────────────
+
+    #[test]
+    fn test_mutation_rng_deterministic() {
+        let mut rng1 = MutationRng::new(42);
+        let mut rng2 = MutationRng::new(42);
+        for _ in 0..100 {
+            assert_eq!(rng1.next_u64(), rng2.next_u64());
+        }
+    }
+
+    #[test]
+    fn test_mutation_rng_bounded() {
+        let mut rng = MutationRng::new(123);
+        for _ in 0..100 {
+            let v = rng.next_usize(10);
+            assert!(v < 10);
+        }
+    }
+
+    #[test]
+    fn test_mutate_swap_operator() {
+        let src = "fn f(x: i64) -> i64 { x + 1 }";
+        let mut rng = MutationRng::new(1);
+        let result = mutate_swap_operator(src, &mut rng);
+        assert!(result.is_some());
+        let (mutated, mutation) = result.unwrap();
+        assert_eq!(mutation.kind, MutationKind::SwapOperator);
+        // Should have swapped + to -
+        assert!(mutated.contains(" - ") || mutated.contains(" * ") || mutated.contains(" / "),
+            "operator not swapped: {}", mutated);
+    }
+
+    #[test]
+    fn test_mutate_perturb_constant() {
+        let src = "fn f() -> i64 { 42 }";
+        let mut rng = MutationRng::new(7);
+        let result = mutate_perturb_constant(src, &mut rng);
+        assert!(result.is_some());
+        let (mutated, mutation) = result.unwrap();
+        assert_eq!(mutation.kind, MutationKind::PerturbConstant);
+        assert!(!mutated.contains("42"), "constant not perturbed: {}", mutated);
+    }
+
+    #[test]
+    fn test_mutate_negate_condition() {
+        let src = "fn f(x: i64) -> i64 { if x == 0 { 1 } else { 0 } }";
+        let mut rng = MutationRng::new(3);
+        let result = mutate_negate_condition(src, &mut rng);
+        assert!(result.is_some());
+        let (mutated, mutation) = result.unwrap();
+        assert_eq!(mutation.kind, MutationKind::NegateCondition);
+        assert!(mutated.contains("!= "), "condition not negated: {}", mutated);
+    }
+
+    #[test]
+    fn test_mutate_source_always_returns() {
+        let src = "fn f() -> i64 { 1 }";
+        let mut rng = MutationRng::new(99);
+        let (_mutated, mutation) = mutate_source(src, &mut rng);
+        // Should always return something (even identity mutation)
+        assert!(!mutation.description.is_empty());
+    }
+
+    #[test]
+    fn test_crossover_sources() {
+        let a = "fn f(x: i64) -> i64 {\n    let a = x + 1\n    let b = a * 2\n    b\n}";
+        let b = "fn f(x: i64) -> i64 {\n    let c = x - 1\n    let d = c / 2\n    d\n}";
+        let child = crossover_sources(a, b);
+        assert!(child.is_some());
+        let child = child.unwrap();
+        assert!(child.starts_with("fn f(x: i64) -> i64 "));
+    }
+
+    #[test]
+    fn test_mutate_and_evolve() {
+        let mut reg = EvolutionRegistry::new();
+        reg.register("m", "fn m(x: i64) -> i64 { x + 1 }");
+        let result = reg.mutate_and_evolve("m", 42);
+        assert!(result.is_ok());
+        let (generation, _hash, mutation) = result.unwrap();
+        assert_eq!(generation, 1);
+        assert!(!mutation.description.is_empty());
+    }
+
+    #[test]
+    fn test_mutation_preserves_function_name() {
+        let src = "fn compute(x: i64) -> i64 { x * 2 + 1 }";
+        let mut rng = MutationRng::new(77);
+        let (mutated, _) = mutate_source(src, &mut rng);
+        assert!(mutated.contains("fn compute("));
     }
 }

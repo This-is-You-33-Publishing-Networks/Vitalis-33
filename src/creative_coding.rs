@@ -20,7 +20,6 @@
 //! - Interactive input: mouse position, keyboard state
 //! - Export to SVG path data
 
-use std::fmt;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  SKETCH FRAMEWORK

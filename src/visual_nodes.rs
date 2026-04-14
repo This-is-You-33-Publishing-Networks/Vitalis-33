@@ -12,7 +12,7 @@
 //! - Live parameter animation and keyframes
 //! - Export to DOT (Graphviz) format
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
 // ═══════════════════════════════════════════════════════════════════════

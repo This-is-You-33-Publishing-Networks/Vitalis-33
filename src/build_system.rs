@@ -4,7 +4,7 @@
 //! caching (SHA-256 keyed), work-stealing parallel scheduling, critical path
 //! analysis, build profiling, and remote compilation protocol primitives.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 // ── Content Hash ─────────────────────────────────────────────────────
 

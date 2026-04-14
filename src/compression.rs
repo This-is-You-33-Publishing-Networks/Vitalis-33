@@ -12,8 +12,6 @@
 //! - Move-to-Front Transform (MTF)
 //! - Bit packing
 
-use std::ffi::CString;
-use std::os::raw::c_char;
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 

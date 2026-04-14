@@ -7,7 +7,6 @@
 //! - **Editor integration**: Syntax highlighting, basic autocomplete
 //! - **Output panels**: Console, AST viewer, IR viewer
 
-use std::collections::HashMap;
 
 // ── Playground Model ────────────────────────────────────────────────
 

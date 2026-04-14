@@ -8,7 +8,7 @@
 //! - **Versioned docs**: Multiple versions with switcher
 //! - **Themes**: Configurable CSS themes, dark/light mode
 
-use std::collections::{HashMap, BTreeMap};
+use std::collections::HashMap;
 
 // ── Document Model ──────────────────────────────────────────────────
 

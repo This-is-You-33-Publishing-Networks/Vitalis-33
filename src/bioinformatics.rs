@@ -10,7 +10,6 @@
 //! - Motif finding (k-mer frequency, Hamming distance search)
 //! - Protein analysis (hydrophobicity, molecular weight)
 
-use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════════════════════
 // 1. DNA/RNA Operations

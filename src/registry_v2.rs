@@ -8,7 +8,7 @@
 //! - **Yanking**: Remove broken versions safely
 //! - **Namespace governance**: Scoped packages with ownership
 
-use std::collections::{HashMap, HashSet, BTreeMap};
+use std::collections::{HashMap, HashSet};
 
 // ── Package Identity ────────────────────────────────────────────────
 

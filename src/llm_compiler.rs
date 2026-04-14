@@ -6,7 +6,6 @@
 //! - **Docstring generation**: Auto-generate documentation
 //! - **Commit message generation**: From staged diff
 
-use std::collections::HashMap;
 
 // ── Error Explanation ───────────────────────────────────────────────
 

@@ -7,7 +7,7 @@
 //! - Configurable test runner with seed replay
 //! - Statistical coverage tracking
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::c_char;
 
 // ─── PRNG (Xorshift128+) ───────────────────────────────────────────

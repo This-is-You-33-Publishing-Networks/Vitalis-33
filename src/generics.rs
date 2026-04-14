@@ -13,6 +13,53 @@
 use std::collections::HashMap;
 use std::fmt;
 
+// ─── Generic Errors ─────────────────────────────────────────────────────
+
+/// Errors produced during generic instantiation or inference.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GenericError {
+    /// Unknown generic function or struct name.
+    UnknownGeneric(String),
+    /// Wrong number of type arguments.
+    ArityMismatch { name: String, expected: usize, got: usize },
+    /// A concrete type does not satisfy a bound on a type parameter.
+    BoundNotSatisfied {
+        param: String,
+        bound: String,
+        concrete_type: String,
+    },
+    /// Could not infer a type parameter from call-site arguments.
+    CannotInfer(String),
+    /// Conflicting type inference for the same parameter.
+    ConflictingInference {
+        param: String,
+        first: String,
+        second: String,
+    },
+}
+
+impl fmt::Display for GenericError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GenericError::UnknownGeneric(name) => {
+                write!(f, "unknown generic `{}`", name)
+            }
+            GenericError::ArityMismatch { name, expected, got } => {
+                write!(f, "`{}` expects {} type argument(s), got {}", name, expected, got)
+            }
+            GenericError::BoundNotSatisfied { param, bound, concrete_type } => {
+                write!(f, "type `{}` does not satisfy bound `{}` on parameter `{}`", concrete_type, bound, param)
+            }
+            GenericError::CannotInfer(param) => {
+                write!(f, "cannot infer type parameter `{}`", param)
+            }
+            GenericError::ConflictingInference { param, first, second } => {
+                write!(f, "conflicting types for `{}`: `{}` vs `{}`", param, first, second)
+            }
+        }
+    }
+}
+
 // ─── Type Parameters ────────────────────────────────────────────────────
 
 /// A type parameter declaration: `T`, `T: Bound`, `T: Bound1 + Bound2`
@@ -178,13 +225,45 @@ impl Monomorphizer {
         self.generic_structs.contains_key(name)
     }
 
-    /// Request a concrete instantiation of a generic function.
-    /// Returns the mangled name of the concrete version.
-    pub fn instantiate_fn(&mut self, name: &str, concrete_types: &[String]) -> Option<String> {
-        let sig = self.generic_fns.get(name)?.clone();
-        if concrete_types.len() != sig.type_params.len() {
-            return None;
+    /// Validate that concrete types satisfy all bounds on the generic signature.
+    fn validate_bounds(sig: &GenericSig, concrete_types: &[String]) -> Result<(), GenericError> {
+        for (param, concrete) in sig.type_params.iter().zip(concrete_types) {
+            for bound_name in &param.bounds {
+                if let Some(bound) = BuiltinBound::from_name(bound_name) {
+                    if !bound.satisfied_by(concrete) {
+                        return Err(GenericError::BoundNotSatisfied {
+                            param: param.name.clone(),
+                            bound: bound_name.clone(),
+                            concrete_type: concrete.clone(),
+                        });
+                    }
+                }
+                // Unknown bounds are ignored (user-defined traits not enforced here)
+            }
         }
+        Ok(())
+    }
+
+    /// Request a concrete instantiation of a generic function.
+    /// Returns the mangled name of the concrete version, or None on arity/unknown errors.
+    pub fn instantiate_fn(&mut self, name: &str, concrete_types: &[String]) -> Option<String> {
+        self.try_instantiate_fn(name, concrete_types).ok()
+    }
+
+    /// Request a concrete instantiation of a generic function with full error reporting.
+    pub fn try_instantiate_fn(&mut self, name: &str, concrete_types: &[String]) -> Result<String, GenericError> {
+        let sig = self.generic_fns.get(name)
+            .ok_or_else(|| GenericError::UnknownGeneric(name.to_string()))?
+            .clone();
+        if concrete_types.len() != sig.type_params.len() {
+            return Err(GenericError::ArityMismatch {
+                name: name.to_string(),
+                expected: sig.type_params.len(),
+                got: concrete_types.len(),
+            });
+        }
+
+        Self::validate_bounds(&sig, concrete_types)?;
 
         let mangled = sig.mangle(concrete_types);
         if !self.instantiated_fns.contains_key(&mangled) {
@@ -194,15 +273,29 @@ impl Monomorphizer {
             }
             self.instantiated_fns.insert(mangled.clone(), (name.to_string(), sub));
         }
-        Some(mangled)
+        Ok(mangled)
     }
 
     /// Request a concrete instantiation of a generic struct.
+    /// Returns the mangled name, or None on arity/unknown errors.
     pub fn instantiate_struct(&mut self, name: &str, concrete_types: &[String]) -> Option<String> {
-        let sig = self.generic_structs.get(name)?.clone();
+        self.try_instantiate_struct(name, concrete_types).ok()
+    }
+
+    /// Request a concrete instantiation of a generic struct with full error reporting.
+    pub fn try_instantiate_struct(&mut self, name: &str, concrete_types: &[String]) -> Result<String, GenericError> {
+        let sig = self.generic_structs.get(name)
+            .ok_or_else(|| GenericError::UnknownGeneric(name.to_string()))?
+            .clone();
         if concrete_types.len() != sig.type_params.len() {
-            return None;
+            return Err(GenericError::ArityMismatch {
+                name: name.to_string(),
+                expected: sig.type_params.len(),
+                got: concrete_types.len(),
+            });
         }
+
+        Self::validate_bounds(&sig, concrete_types)?;
 
         let mangled = sig.mangle(concrete_types);
         if !self.instantiated_structs.contains_key(&mangled) {
@@ -212,7 +305,7 @@ impl Monomorphizer {
             }
             self.instantiated_structs.insert(mangled.clone(), (name.to_string(), sub));
         }
-        Some(mangled)
+        Ok(mangled)
     }
 
     /// Get all instantiated function names with their substitutions.
@@ -243,8 +336,20 @@ pub fn infer_type_params(
     sig: &GenericSig,
     arg_types: &[String],
 ) -> Option<TypeSubstitution> {
+    try_infer_type_params(sig, arg_types).ok()
+}
+
+/// Infer type parameters with full error reporting.
+pub fn try_infer_type_params(
+    sig: &GenericSig,
+    arg_types: &[String],
+) -> Result<TypeSubstitution, GenericError> {
     if arg_types.len() != sig.param_types.len() {
-        return None;
+        return Err(GenericError::ArityMismatch {
+            name: sig.name.clone(),
+            expected: sig.param_types.len(),
+            got: arg_types.len(),
+        });
     }
 
     let mut sub = TypeSubstitution::new();
@@ -253,7 +358,11 @@ pub fn infer_type_params(
             if sub.is_bound(param_ty) {
                 // Already bound — check consistency
                 if sub.resolve(param_ty) != *arg_ty {
-                    return None; // Conflicting types
+                    return Err(GenericError::ConflictingInference {
+                        param: param_ty.clone(),
+                        first: sub.resolve(param_ty),
+                        second: arg_ty.clone(),
+                    });
                 }
             } else {
                 sub.bind(param_ty, arg_ty);
@@ -267,12 +376,18 @@ pub fn infer_type_params(
             if let Some(ref default) = tp.default {
                 sub.bind(&tp.name, default);
             } else {
-                return None; // Cannot infer
+                return Err(GenericError::CannotInfer(tp.name.clone()));
             }
         }
     }
 
-    Some(sub)
+    // Validate bounds on inferred types
+    let concrete_types: Vec<String> = sig.type_params.iter()
+        .map(|tp| sub.resolve(&tp.name))
+        .collect();
+    Monomorphizer::validate_bounds(sig, &concrete_types)?;
+
+    Ok(sub)
 }
 
 // ─── Built-in Trait Bounds ──────────────────────────────────────────────
@@ -509,5 +624,276 @@ mod tests {
         assert_eq!(sig.type_param_index("A"), Some(0));
         assert_eq!(sig.type_param_index("B"), Some(1));
         assert_eq!(sig.type_param_index("C"), None);
+    }
+
+    // ─── v133 Tests: Generic Bounds Checking ────────────────────────────
+
+    #[test]
+    fn test_v133_bounds_enforced_on_instantiate_fn() {
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("add", vec![
+            TypeParam::new("T").with_bound("Numeric"),
+        ]);
+        mono.register_generic_fn(sig);
+
+        // i64 satisfies Numeric → Ok
+        assert_eq!(mono.instantiate_fn("add", &["i64".into()]), Some("add_i64".into()));
+        // bool does NOT satisfy Numeric → None
+        assert_eq!(mono.instantiate_fn("add", &["bool".into()]), None);
+    }
+
+    #[test]
+    fn test_v133_bounds_enforced_on_instantiate_struct() {
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("NumBox", vec![
+            TypeParam::new("T").with_bound("Numeric"),
+        ]);
+        mono.register_generic_struct(sig);
+
+        assert_eq!(mono.instantiate_struct("NumBox", &["f64".into()]), Some("NumBox_f64".into()));
+        assert_eq!(mono.instantiate_struct("NumBox", &["str".into()]), None);
+    }
+
+    #[test]
+    fn test_v133_try_instantiate_fn_error_details() {
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("add", vec![
+            TypeParam::new("T").with_bound("Numeric"),
+        ]);
+        mono.register_generic_fn(sig);
+
+        let err = mono.try_instantiate_fn("add", &["bool".into()]).unwrap_err();
+        assert_eq!(err, GenericError::BoundNotSatisfied {
+            param: "T".into(),
+            bound: "Numeric".into(),
+            concrete_type: "bool".into(),
+        });
+    }
+
+    #[test]
+    fn test_v133_try_instantiate_fn_unknown() {
+        let mut mono = Monomorphizer::new();
+        let err = mono.try_instantiate_fn("nonexistent", &["i64".into()]).unwrap_err();
+        assert_eq!(err, GenericError::UnknownGeneric("nonexistent".into()));
+    }
+
+    #[test]
+    fn test_v133_try_instantiate_arity_error() {
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("pair", vec![
+            TypeParam::new("A"),
+            TypeParam::new("B"),
+        ]);
+        mono.register_generic_fn(sig);
+
+        let err = mono.try_instantiate_fn("pair", &["i64".into()]).unwrap_err();
+        assert_eq!(err, GenericError::ArityMismatch {
+            name: "pair".into(),
+            expected: 2,
+            got: 1,
+        });
+    }
+
+    #[test]
+    fn test_v133_multiple_bounds() {
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("sort", vec![
+            TypeParam::new("T").with_bound("Ord").with_bound("Copy"),
+        ]);
+        mono.register_generic_fn(sig);
+
+        // i64 satisfies both Ord and Copy
+        assert!(mono.try_instantiate_fn("sort", &["i64".into()]).is_ok());
+        // str does NOT satisfy Ord
+        assert!(mono.try_instantiate_fn("sort", &["str".into()]).is_err());
+    }
+
+    #[test]
+    fn test_v133_copy_bound() {
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("dup", vec![
+            TypeParam::new("T").with_bound("Copy"),
+        ]);
+        mono.register_generic_fn(sig);
+
+        assert!(mono.instantiate_fn("dup", &["i32".into()]).is_some());
+        assert!(mono.instantiate_fn("dup", &["bool".into()]).is_some());
+        // str is NOT Copy
+        assert!(mono.instantiate_fn("dup", &["str".into()]).is_none());
+    }
+
+    #[test]
+    fn test_v133_infer_with_bounds_satisfied() {
+        let mut sig = GenericSig::new("add", vec![
+            TypeParam::new("T").with_bound("Numeric"),
+        ]);
+        sig.param_types = vec!["T".into(), "T".into()];
+
+        // i64 satisfies Numeric
+        let result = try_infer_type_params(&sig, &["i64".into(), "i64".into()]);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().resolve("T"), "i64");
+    }
+
+    #[test]
+    fn test_v133_infer_with_bounds_violated() {
+        let mut sig = GenericSig::new("add", vec![
+            TypeParam::new("T").with_bound("Numeric"),
+        ]);
+        sig.param_types = vec!["T".into(), "T".into()];
+
+        // bool does NOT satisfy Numeric
+        let result = try_infer_type_params(&sig, &["bool".into(), "bool".into()]);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GenericError::BoundNotSatisfied { param, bound, concrete_type } => {
+                assert_eq!(param, "T");
+                assert_eq!(bound, "Numeric");
+                assert_eq!(concrete_type, "bool");
+            }
+            other => panic!("expected BoundNotSatisfied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_v133_infer_conflicting_detailed() {
+        let mut sig = GenericSig::new("eq", vec![TypeParam::new("T")]);
+        sig.param_types = vec!["T".into(), "T".into()];
+
+        let err = try_infer_type_params(&sig, &["i64".into(), "f64".into()]).unwrap_err();
+        assert_eq!(err, GenericError::ConflictingInference {
+            param: "T".into(),
+            first: "i64".into(),
+            second: "f64".into(),
+        });
+    }
+
+    #[test]
+    fn test_v133_infer_cannot_infer() {
+        let mut sig = GenericSig::new("zero", vec![TypeParam::new("T")]);
+        sig.param_types = vec![]; // no params to infer from
+
+        let err = try_infer_type_params(&sig, &[]).unwrap_err();
+        assert_eq!(err, GenericError::CannotInfer("T".into()));
+    }
+
+    #[test]
+    fn test_v133_error_display() {
+        let err = GenericError::BoundNotSatisfied {
+            param: "T".into(),
+            bound: "Numeric".into(),
+            concrete_type: "bool".into(),
+        };
+        assert_eq!(
+            format!("{}", err),
+            "type `bool` does not satisfy bound `Numeric` on parameter `T`"
+        );
+
+        let err2 = GenericError::ArityMismatch {
+            name: "pair".into(),
+            expected: 2,
+            got: 1,
+        };
+        assert_eq!(format!("{}", err2), "`pair` expects 2 type argument(s), got 1");
+    }
+
+    #[test]
+    fn test_v133_display_bound() {
+        // Display bound is satisfied by all types
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("show", vec![
+            TypeParam::new("T").with_bound("Display"),
+        ]);
+        mono.register_generic_fn(sig);
+        assert!(mono.instantiate_fn("show", &["i32".into()]).is_some());
+        assert!(mono.instantiate_fn("show", &["bool".into()]).is_some());
+        assert!(mono.instantiate_fn("show", &["str".into()]).is_some());
+    }
+
+    #[test]
+    fn test_v133_default_bound() {
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("make_default", vec![
+            TypeParam::new("T").with_bound("Default"),
+        ]);
+        mono.register_generic_fn(sig);
+
+        assert!(mono.instantiate_fn("make_default", &["i64".into()]).is_some());
+        assert!(mono.instantiate_fn("make_default", &["bool".into()]).is_some());
+        // str does NOT satisfy Default
+        assert!(mono.instantiate_fn("make_default", &["str".into()]).is_none());
+    }
+
+    #[test]
+    fn test_v133_no_bounds_still_works() {
+        // Unbounded generics should still work as before
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("identity", vec![TypeParam::new("T")]);
+        mono.register_generic_fn(sig);
+
+        assert!(mono.instantiate_fn("identity", &["i64".into()]).is_some());
+        assert!(mono.instantiate_fn("identity", &["bool".into()]).is_some());
+        assert!(mono.instantiate_fn("identity", &["str".into()]).is_some());
+        assert!(mono.instantiate_fn("identity", &["MyStruct".into()]).is_some());
+    }
+
+    #[test]
+    fn test_v133_unknown_bound_ignored() {
+        // User-defined bounds (not in BuiltinBound) should be ignored, not rejected
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("widget", vec![
+            TypeParam::new("T").with_bound("MyCustomTrait"),
+        ]);
+        mono.register_generic_fn(sig);
+
+        // Unknown bound is ignored → instantiation succeeds
+        assert!(mono.instantiate_fn("widget", &["anything".into()]).is_some());
+    }
+
+    #[test]
+    fn test_v133_substitution_all_bound() {
+        let params = vec![
+            TypeParam::new("A"),
+            TypeParam::new("B"),
+        ];
+        let mut sub = TypeSubstitution::new();
+        assert!(!sub.all_bound(&params));
+        sub.bind("A", "i64");
+        assert!(!sub.all_bound(&params));
+        sub.bind("B", "str");
+        assert!(sub.all_bound(&params));
+    }
+
+    #[test]
+    fn test_v133_try_instantiate_struct_error() {
+        let mut mono = Monomorphizer::new();
+        let sig = GenericSig::new("NumPair", vec![
+            TypeParam::new("A").with_bound("Numeric"),
+            TypeParam::new("B").with_bound("Numeric"),
+        ]);
+        mono.register_generic_struct(sig);
+
+        // Both numeric → ok
+        assert!(mono.try_instantiate_struct("NumPair", &["i64".into(), "f64".into()]).is_ok());
+        // First ok, second fails
+        let err = mono.try_instantiate_struct("NumPair", &["i64".into(), "bool".into()]).unwrap_err();
+        assert_eq!(err, GenericError::BoundNotSatisfied {
+            param: "B".into(),
+            bound: "Numeric".into(),
+            concrete_type: "bool".into(),
+        });
+    }
+
+    #[test]
+    fn test_v133_infer_default_with_bounds() {
+        let mut sig = GenericSig::new("zero", vec![
+            TypeParam::new("T").with_bound("Numeric").with_default("i64"),
+        ]);
+        sig.param_types = vec![];
+
+        // Default i64 satisfies Numeric → ok
+        let result = try_infer_type_params(&sig, &[]);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().resolve("T"), "i64");
     }
 }

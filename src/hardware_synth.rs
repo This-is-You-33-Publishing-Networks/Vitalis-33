@@ -9,7 +9,6 @@
 //! - **Verilog output**: Emit synthesizable Verilog
 
 use std::collections::HashMap;
-use std::fmt;
 
 // ── Data Types ──────────────────────────────────────────────────────
 

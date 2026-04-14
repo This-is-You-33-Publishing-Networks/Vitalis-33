@@ -6,7 +6,7 @@
 //!
 //! Modeled after Go channels, Rust std::sync, and Swift structured concurrency.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 // ── Error Types ──────────────────────────────────────────────────────
@@ -1085,6 +1085,187 @@ impl Default for DeadlockDetector {
     }
 }
 
+// ── v85: Work-Stealing Scheduler + Lock Diagnostics ────────────────
+
+/// Lightweight schedulable unit for deterministic work-stealing simulation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchedTask {
+    pub id: u64,
+    pub priority: u8,
+    pub payload: ConcValue,
+}
+
+impl SchedTask {
+    pub fn new(id: u64, priority: u8, payload: ConcValue) -> Self {
+        Self { id, priority, payload }
+    }
+}
+
+/// Work-stealing scheduler with per-worker deques and contention-aware queueing.
+#[derive(Debug, Clone)]
+pub struct WorkStealingScheduler {
+    workers: Vec<VecDeque<SchedTask>>,
+    overflow: VecDeque<SchedTask>,
+    enqueue_contention: u64,
+    steals: u64,
+    completed: u64,
+}
+
+impl WorkStealingScheduler {
+    pub fn new(worker_count: usize) -> Self {
+        Self {
+            workers: vec![VecDeque::new(); worker_count.max(1)],
+            overflow: VecDeque::new(),
+            enqueue_contention: 0,
+            steals: 0,
+            completed: 0,
+        }
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Enqueue with optional affinity. Hot queues are diverted to least-loaded worker.
+    pub fn enqueue(&mut self, task: SchedTask, preferred_worker: Option<usize>) {
+        let target = preferred_worker.unwrap_or(0).min(self.workers.len().saturating_sub(1));
+        let hottest_len = self.workers[target].len();
+        let avg_len = self.total_queued() / self.workers.len().max(1);
+        let hot_queue = hottest_len > avg_len.saturating_add(2);
+
+        if hot_queue {
+            self.enqueue_contention += 1;
+            let mut min_idx = 0usize;
+            let mut min_len = usize::MAX;
+            for (idx, q) in self.workers.iter().enumerate() {
+                if q.len() < min_len {
+                    min_len = q.len();
+                    min_idx = idx;
+                }
+            }
+            self.workers[min_idx].push_back(task);
+            return;
+        }
+
+        self.workers[target].push_back(task);
+    }
+
+    /// Promote overflow work into the lightest worker queue.
+    pub fn rebalance_overflow(&mut self) {
+        while let Some(task) = self.overflow.pop_front() {
+            let mut min_idx = 0usize;
+            let mut min_len = usize::MAX;
+            for (idx, q) in self.workers.iter().enumerate() {
+                if q.len() < min_len {
+                    min_len = q.len();
+                    min_idx = idx;
+                }
+            }
+            self.workers[min_idx].push_back(task);
+        }
+    }
+
+    pub fn push_overflow(&mut self, task: SchedTask) {
+        self.overflow.push_back(task);
+    }
+
+    /// Pop local task or steal from a peer's tail.
+    pub fn pop_or_steal(&mut self, worker_id: usize) -> Option<SchedTask> {
+        if self.workers.is_empty() {
+            return None;
+        }
+        let idx = worker_id.min(self.workers.len() - 1);
+
+        if let Some(task) = self.workers[idx].pop_front() {
+            self.completed += 1;
+            return Some(task);
+        }
+
+        for step in 1..self.workers.len() {
+            let victim = (idx + step) % self.workers.len();
+            if let Some(task) = self.workers[victim].pop_back() {
+                self.steals += 1;
+                self.completed += 1;
+                return Some(task);
+            }
+        }
+
+        if let Some(task) = self.overflow.pop_front() {
+            self.completed += 1;
+            return Some(task);
+        }
+        None
+    }
+
+    pub fn worker_loads(&self) -> Vec<usize> {
+        self.workers.iter().map(|q| q.len()).collect()
+    }
+
+    pub fn total_queued(&self) -> usize {
+        self.workers.iter().map(|q| q.len()).sum::<usize>() + self.overflow.len()
+    }
+
+    pub fn contention_score(&self) -> u64 {
+        self.enqueue_contention
+    }
+
+    pub fn steal_count(&self) -> u64 {
+        self.steals
+    }
+
+    pub fn completed_count(&self) -> u64 {
+        self.completed
+    }
+}
+
+/// Diagnostic report with cycle and waiter pressure information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadlockReport {
+    pub has_deadlock: bool,
+    pub cycle_nodes: Vec<String>,
+    pub blocking_edges: Vec<(String, String)>,
+    pub wait_pressure: Vec<(String, usize)>,
+}
+
+impl DeadlockDetector {
+    /// Build a deterministic report for observability and triage.
+    pub fn diagnostics(&self) -> DeadlockReport {
+        let cycle_nodes = self.find_cycle().unwrap_or_default();
+
+        let mut edge_counts: HashMap<String, usize> = HashMap::new();
+        for (waiter, _) in &self.edges {
+            *edge_counts.entry(waiter.clone()).or_insert(0) += 1;
+        }
+        let mut wait_pressure: Vec<(String, usize)> = edge_counts.into_iter().collect();
+        wait_pressure.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        let mut blocking_edges = self.edges.clone();
+        blocking_edges.sort();
+
+        DeadlockReport {
+            has_deadlock: !cycle_nodes.is_empty(),
+            cycle_nodes,
+            blocking_edges,
+            wait_pressure,
+        }
+    }
+}
+
+/// Stress the scheduler using deterministic affinity patterns.
+pub fn run_scheduler_stress(worker_count: usize, tasks: usize) -> (u64, u64) {
+    let mut sched = WorkStealingScheduler::new(worker_count);
+    for i in 0..tasks {
+        let preferred = Some(i % worker_count.max(1));
+        let task = SchedTask::new(i as u64, (i % 8) as u8, ConcValue::Int(i as i64));
+        sched.enqueue(task, preferred);
+    }
+
+    for worker in 0..worker_count.max(1) {
+        while sched.pop_or_steal(worker).is_some() {}
+    }
+    (sched.completed_count(), sched.steal_count())
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -1649,5 +1830,55 @@ mod tests {
             channel_name: "results".into(),
             value: ConcValue::Int(1),
         });
+    }
+
+    // ── v85: Work-Stealing Scheduler + Diagnostics ─────────────────
+
+    #[test]
+    fn test_work_stealing_balances_hot_queue() {
+        let mut sched = WorkStealingScheduler::new(3);
+        for i in 0..12 {
+            sched.enqueue(SchedTask::new(i, 0, ConcValue::Int(i as i64)), Some(0));
+        }
+
+        let loads = sched.worker_loads();
+        assert_eq!(loads.iter().sum::<usize>(), 12);
+        assert!(loads[1] > 0 || loads[2] > 0);
+        assert!(sched.contention_score() > 0);
+    }
+
+    #[test]
+    fn test_work_stealing_pop_and_steal() {
+        let mut sched = WorkStealingScheduler::new(2);
+        sched.enqueue(SchedTask::new(1, 0, ConcValue::Int(1)), Some(0));
+        sched.enqueue(SchedTask::new(2, 0, ConcValue::Int(2)), Some(0));
+        sched.enqueue(SchedTask::new(3, 0, ConcValue::Int(3)), Some(0));
+
+        let _ = sched.pop_or_steal(0);
+        let stolen = sched.pop_or_steal(1);
+        assert!(stolen.is_some());
+        assert!(sched.steal_count() >= 1);
+    }
+
+    #[test]
+    fn test_deadlock_diagnostics_report() {
+        let mut dd = DeadlockDetector::new();
+        dd.add_wait("t1", "t2");
+        dd.add_wait("t2", "t3");
+        dd.add_wait("t3", "t1");
+        dd.add_wait("t4", "t2");
+
+        let report = dd.diagnostics();
+        assert!(report.has_deadlock);
+        assert!(!report.cycle_nodes.is_empty());
+        assert_eq!(report.blocking_edges.len(), 4);
+        assert!(report.wait_pressure.iter().any(|(node, count)| node == "t1" && *count == 1));
+    }
+
+    #[test]
+    fn test_scheduler_stress_completes_all_tasks() {
+        let (completed, steals) = run_scheduler_stress(4, 128);
+        assert_eq!(completed, 128);
+        assert!(steals <= 128);
     }
 }

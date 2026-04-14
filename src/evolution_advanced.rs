@@ -735,7 +735,7 @@ mod tests {
         let mut gbf = pbf[0];
 
         for g in 0..100 {
-            let b = unsafe {
+            let _b = unsafe {
                 vitalis_evo_pso_step(
                     pos.as_mut_ptr(), vel.as_mut_ptr(),
                     pb.as_mut_ptr(), pbf.as_mut_ptr(),

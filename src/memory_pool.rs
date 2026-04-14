@@ -385,7 +385,7 @@ impl BuddyAllocator {
 
         // Split down to target level
         let mut current_level = found_level;
-        let mut current_offset = offset;
+        let current_offset = offset;
         while current_level < target_level {
             current_level += 1;
             let buddy_offset = current_offset + self.block_size_at_level(current_level);

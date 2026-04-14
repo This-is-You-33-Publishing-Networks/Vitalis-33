@@ -735,6 +735,118 @@ impl VitalisEngine {
     }
 }
 
+// ─── Integration Pipeline ───────────────────────────────────────────────
+
+/// Full integration pipeline result — agent-driven evolution with
+/// mutation strategies, self-optimizer pass ordering, and meta-evolution.
+pub struct IntegrationPipelineResult {
+    pub cycles: usize,
+    pub total_evolutions: usize,
+    pub successful_evolutions: usize,
+    pub agent_improvements: usize,
+    pub meta_evolution_triggered: bool,
+    pub best_fitness: f64,
+}
+
+impl IntegrationPipelineResult {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"cycles\":{},\"total_evolutions\":{},\"successful\":{},\"agent_improvements\":{},\"meta_evolved\":{},\"best_fitness\":{:.4}}}",
+            self.cycles, self.total_evolutions, self.successful_evolutions,
+            self.agent_improvements, self.meta_evolution_triggered, self.best_fitness,
+        )
+    }
+}
+
+impl VitalisEngine {
+    /// Run the full integration pipeline:
+    /// 1. Agent observes landscape and plans
+    /// 2. Mutation strategies generate variants
+    /// 3. Engine validates, compiles, and scores
+    /// 4. Self-optimizer orders passes for IR optimization
+    /// 5. Meta-evolution tunes strategies periodically
+    pub fn run_integration_pipeline(&mut self, cycles: usize) -> IntegrationPipelineResult {
+        let mut result = IntegrationPipelineResult {
+            cycles: 0,
+            total_evolutions: 0,
+            successful_evolutions: 0,
+            agent_improvements: 0,
+            meta_evolution_triggered: false,
+            best_fitness: self.stats.best_fitness,
+        };
+
+        for _ in 0..cycles {
+            result.cycles += 1;
+
+            // Run a standard engine cycle
+            let cycle = self.run_cycle();
+            result.total_evolutions += cycle.attempts.len();
+            result.successful_evolutions += cycle.attempts.iter().filter(|a| a.success).count();
+            result.agent_improvements += cycle.functions_improved;
+
+            // Update best fitness
+            for attempt in &cycle.attempts {
+                if attempt.fitness > result.best_fitness {
+                    result.best_fitness = attempt.fitness;
+                }
+            }
+
+            // Try mutation-based evolution on registered functions
+            let functions: Vec<(String, String)> = with_registry(|reg| {
+                reg.list_evolvable().iter().map(|name| {
+                    let source = reg.get_source(name).unwrap_or("").to_string();
+                    (name.clone(), source)
+                }).collect()
+            });
+
+            for (name, source) in &functions {
+                if source.is_empty() { continue; }
+                // Apply a simple mutation
+                let mut rng = crate::evolution::MutationRng::new(result.cycles as u64);
+                let (mutated, _mutation) = crate::evolution::mutate_source(source, &mut rng);
+                if mutated != *source {
+                    let attempt = self.evolve(name, &mutated);
+                    result.total_evolutions += 1;
+                    if attempt.success {
+                        result.successful_evolutions += 1;
+                        if attempt.fitness > attempt.prev_fitness {
+                            result.agent_improvements += 1;
+                        }
+                    }
+                }
+            }
+
+            // Trigger meta-evolution every 5 cycles
+            if result.cycles % 5 == 0 {
+                with_meta(|meta| {
+                    meta.meta_evolve();
+                });
+                result.meta_evolution_triggered = true;
+            }
+        }
+
+        // Update engine best fitness
+        if result.best_fitness > self.stats.best_fitness {
+            self.stats.best_fitness = result.best_fitness;
+        }
+
+        result
+    }
+
+    /// Diagnostics covering all subsystems: engine + meta-evolution + agent stats.
+    pub fn full_diagnostics_json(&self) -> String {
+        let engine_stats = self.stats_json();
+        let meta_stats = with_meta(|meta| {
+            format!("\"strategy_count\":{}", meta.strategy_count())
+        });
+        let landscape = self.get_landscape();
+        format!(
+            "{{\"engine\":{},\"meta\":{{{}}},\"landscape\":{}}}",
+            engine_stats, meta_stats, landscape,
+        )
+    }
+}
+
 // ─── Global Engine (thread-local) ───────────────────────────────────────
 
 use std::cell::RefCell;
@@ -848,5 +960,78 @@ mod tests {
         let result = engine.validate("fn main() -> i64 { 42 }");
         let json = result.to_json();
         assert!(json.contains("\"valid\":true"));
+    }
+
+    // ── v70: Integration pipeline tests ──────────────────────────────────
+
+    #[test]
+    fn test_integration_pipeline_empty() {
+        let mut engine = VitalisEngine::new();
+        let result = engine.run_integration_pipeline(1);
+        assert_eq!(result.cycles, 1);
+        // No functions registered, so no evolutions
+        assert_eq!(result.total_evolutions, 0);
+    }
+
+    #[test]
+    fn test_integration_pipeline_with_functions() {
+        let mut engine = VitalisEngine::new();
+        engine.register("pipe_fn", "fn pipe_fn(x: i64) -> i64 { x + 1 }");
+        let result = engine.run_integration_pipeline(2);
+        assert_eq!(result.cycles, 2);
+        assert!(result.total_evolutions >= 2); // At least 2 cycle attempts + mutations
+    }
+
+    #[test]
+    fn test_integration_pipeline_meta_evolution() {
+        let mut engine = VitalisEngine::new();
+        engine.register("meta_fn", "fn meta_fn(x: i64) -> i64 { x * 2 }");
+        let result = engine.run_integration_pipeline(5);
+        assert!(result.meta_evolution_triggered, "meta-evolution should trigger at cycle 5");
+    }
+
+    #[test]
+    fn test_integration_pipeline_result_json() {
+        let result = IntegrationPipelineResult {
+            cycles: 10,
+            total_evolutions: 20,
+            successful_evolutions: 15,
+            agent_improvements: 8,
+            meta_evolution_triggered: true,
+            best_fitness: 85.5,
+        };
+        let json = result.to_json();
+        assert!(json.contains("\"cycles\":10"));
+        assert!(json.contains("\"successful\":15"));
+        assert!(json.contains("\"meta_evolved\":true"));
+    }
+
+    #[test]
+    fn test_full_diagnostics_json() {
+        let mut engine = VitalisEngine::new();
+        engine.register("diag_fn", "fn diag_fn(x: i64) -> i64 { x }");
+        let json = engine.full_diagnostics_json();
+        assert!(json.contains("\"engine\""));
+        assert!(json.contains("\"meta\""));
+        assert!(json.contains("\"landscape\""));
+        assert!(json.contains("diag_fn"));
+    }
+
+    #[test]
+    fn test_integration_pipeline_fitness_tracking() {
+        let mut engine = VitalisEngine::new();
+        engine.register("fit_fn", "fn fit_fn(x: i64) -> i64 { x + 1 }");
+        let result = engine.run_integration_pipeline(3);
+        assert!(result.best_fitness >= 0.0);
+    }
+
+    #[test]
+    fn test_integration_pipeline_multiple_functions() {
+        let mut engine = VitalisEngine::new();
+        engine.register("fn_a", "fn fn_a(x: i64) -> i64 { x + 1 }");
+        engine.register("fn_b", "fn fn_b(x: i64) -> i64 { x * 2 }");
+        engine.register("fn_c", "fn fn_c(x: i64) -> i64 { x - 1 }");
+        let result = engine.run_integration_pipeline(2);
+        assert!(result.total_evolutions >= 6); // 3 funcs * 2 cycles minimum
     }
 }

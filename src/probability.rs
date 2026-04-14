@@ -183,7 +183,7 @@ pub unsafe extern "C" fn vitalis_normal_inv_cdf(p: f64) -> f64 {
             4.257193509655108e1, 1.0,
         ];
         let num: f64 = ((((((c[0]*r + c[1])*r + c[2])*r + c[3])*r + c[4])*r + c[5])*r + c[6])*r + c[7];
-        let den: f64 = (((((((d[0]*r + d[1])*r + d[2])*r + d[3])*r + d[4])*r + d[5])*r + d[6])*r + d[7]);
+        let den: f64 = ((((((d[0]*r + d[1])*r + d[2])*r + d[3])*r + d[4])*r + d[5])*r + d[6])*r + d[7];
         return q * num / den;
     }
 
@@ -192,7 +192,7 @@ pub unsafe extern "C" fn vitalis_normal_inv_cdf(p: f64) -> f64 {
 
     let result = if s <= 5.0 {
         let s = s - 1.6;
-        let num: f64 = (((((a[0]*s + a[1])*s + a[2])*s + a[3])*s + a[4])*s + a[5]);
+        let num: f64 = ((((a[0]*s + a[1])*s + a[2])*s + a[3])*s + a[4])*s + a[5];
         let den: f64 = ((((b[0]*s + b[1])*s + b[2])*s + b[3])*s + b[4])*s + 1.0;
         num / den
     } else {

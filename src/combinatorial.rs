@@ -4,7 +4,6 @@
 //! simplex LP, genetic algorithm, ant colony optimization, traveling salesman,
 //! and scheduling algorithms. All functions are FFI-safe.
 
-use std::collections::HashMap;
 
 // ─── 0/1 Knapsack (Dynamic Programming) ─────────────────────────────
 

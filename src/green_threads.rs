@@ -9,9 +9,7 @@
 //! - **I/O integration**: Non-blocking I/O awareness
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Condvar};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // ── Green Thread State ───────────────────────────────────────────────
 

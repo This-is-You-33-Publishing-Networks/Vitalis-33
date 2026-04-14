@@ -378,6 +378,43 @@ Source (.sl) → Lexer (lexer.rs) → Tokens
 | `hotpath.rs` | High-performance native operations |
 | `bridge.rs` | C FFI exports |
 | `optimizer.rs` | Optimization passes |
+| `jit_symbols.rs` | JIT symbol registration for all modules |
 | `evolution.rs` | Evolution system |
 | `engine.rs` | Evolution cycle runner |
 | `memory.rs` | Engram memory store |
+
+---
+
+## 4-Layer JIT Registration Pattern
+
+To make a Rust function callable from `.sl` code via JIT, it must be registered in 4 places:
+
+### Layer 1: `types.rs` — Register Builtin Type Signature
+
+```rust
+// types.rs — inside register_builtins()
+self.register_builtin("my_func", &[Type::F64, Type::F64], Type::F64);
+```
+
+### Layer 2: `ir.rs` — Add `fn_sigs` Entry
+
+```rust
+// ir.rs — inside fn_sigs initialization
+sigs.insert("my_func".into(), (vec![IrType::F64, IrType::F64], IrType::F64));
+```
+
+### Layer 3: `codegen.rs` — Add Name Mapping
+
+```rust
+// codegen.rs — inside the match that maps .sl names to runtime symbols
+"my_func" => "slang_my_func",
+```
+
+### Layer 4: `jit_symbols.rs` — Register Symbol Address
+
+```rust
+// jit_symbols.rs — inside register_jit_symbols()
+sym_as!(module, "slang_my_func", my_module::actual_rust_fn, fn(f64, f64) -> f64);
+```
+
+If any layer is missing, the function either won't type-check, won't lower to IR, won't get code generated, or won't link at JIT time.

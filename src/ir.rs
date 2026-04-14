@@ -158,6 +158,14 @@ pub enum Inst {
     FieldGet { result: Value, object: Value, field_index: u32, ty: IrType },
     /// Store a value to a struct field at `field_index * 8` byte offset.
     FieldSet { object: Value, field_index: u32, value: Value },
+
+    // ── Phase 7 (v107): Enums ──────────────────────────────────────────────
+    /// Allocate an enum value: [tag: i64, field0, field1, ...] on the stack.
+    EnumAlloc { result: Value, tag: u32, fields: Vec<Value> },
+    /// Extract the tag (discriminant) from an enum value: result = *ptr as i64.
+    EnumTag { result: Value, enum_val: Value },
+    /// Extract a payload field from an enum value: result = *(ptr + 8 + field_index*8).
+    EnumField { result: Value, enum_val: Value, field_index: u32, ty: IrType },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -266,133 +274,32 @@ pub struct IrBuilder {
     loop_stack: Vec<(BlockId, BlockId)>,
     /// Module prefix stack for name mangling (e.g. ["math"] → "math_")
     module_prefix: Vec<String>,
+    /// v106: Closure variable bindings: var_name → (lambda_fn_name, capture_values)
+    closure_info: HashMap<String, (String, Vec<Value>)>,
+    /// v106: Set by Lambda lowering, consumed by Let binding
+    last_closure_info: Option<(String, Vec<Value>)>,
 }
 
 impl IrBuilder {
     pub fn new() -> Self {
-        let mut fn_sigs: HashMap<String, (Vec<IrType>, IrType)> = HashMap::new();
-        // Register stdlib builtin signatures so call return types are correct.
-        // I/O (void return)
-        for name in &["print", "println", "print_f64", "println_f64",
-                       "print_bool", "println_bool", "print_str", "println_str"] {
-            fn_sigs.insert(name.to_string(), (vec![IrType::I64], IrType::Void));
-        }
-        // Math f64 → f64
-        for name in &["sqrt", "ln", "log2", "log10", "sin", "cos", "exp",
-                       "floor", "ceil", "round", "abs_f64"] {
-            fn_sigs.insert(name.to_string(), (vec![IrType::F64], IrType::F64));
-        }
-        fn_sigs.insert("pow".into(),     (vec![IrType::F64, IrType::F64], IrType::F64));
-        fn_sigs.insert("min_f64".into(), (vec![IrType::F64, IrType::F64], IrType::F64));
-        fn_sigs.insert("max_f64".into(), (vec![IrType::F64, IrType::F64], IrType::F64));
-        // Math i64
-        fn_sigs.insert("abs".into(),  (vec![IrType::I64], IrType::I64));
-        fn_sigs.insert("min".into(),  (vec![IrType::I64, IrType::I64], IrType::I64));
-        fn_sigs.insert("max".into(),  (vec![IrType::I64, IrType::I64], IrType::I64));
-        // Conversions
-        fn_sigs.insert("to_f64".into(),     (vec![IrType::I64], IrType::F64));
-        fn_sigs.insert("to_i64".into(),     (vec![IrType::F64], IrType::I64));
-        fn_sigs.insert("i64_to_f64".into(), (vec![IrType::I64], IrType::F64));
-        fn_sigs.insert("f64_to_i64".into(), (vec![IrType::F64], IrType::I64));
-        // Strings
-        fn_sigs.insert("str_len".into(), (vec![IrType::Ptr], IrType::I64));
-        fn_sigs.insert("str_eq".into(),  (vec![IrType::Ptr, IrType::Ptr], IrType::Bool));
-        fn_sigs.insert("str_cat".into(), (vec![IrType::Ptr, IrType::Ptr], IrType::Ptr));
-        // Extended math
-        fn_sigs.insert("clamp_f64".into(), (vec![IrType::F64, IrType::F64, IrType::F64], IrType::F64));
-        fn_sigs.insert("clamp_i64".into(), (vec![IrType::I64, IrType::I64, IrType::I64], IrType::I64));
-        fn_sigs.insert("atan2".into(),     (vec![IrType::F64, IrType::F64], IrType::F64));
-        fn_sigs.insert("hypot".into(),     (vec![IrType::F64, IrType::F64], IrType::F64));
-        fn_sigs.insert("rand_f64".into(),  (vec![], IrType::F64));
-        fn_sigs.insert("rand_i64".into(),  (vec![], IrType::I64));
-        // Phase 4: Array builtins
+        // v129: Auto-derive IR signatures from the single source of truth in stdlib.rs
+        let mut fn_sigs = crate::stdlib::builtin_ir_sigs();
+
+        // Extra IR-level entries not in stdlib (internal codegen names, aliases)
         fn_sigs.insert("slang_array_alloc".into(),    (vec![IrType::I64, IrType::I64], IrType::Ptr));
         fn_sigs.insert("slang_array_get_i64".into(),  (vec![IrType::Ptr, IrType::I64], IrType::I64));
         fn_sigs.insert("slang_array_set_i64".into(),  (vec![IrType::Ptr, IrType::I64, IrType::I64], IrType::Void));
         fn_sigs.insert("slang_array_get_f64".into(),  (vec![IrType::Ptr, IrType::I64], IrType::F64));
         fn_sigs.insert("slang_array_set_f64".into(),  (vec![IrType::Ptr, IrType::I64, IrType::F64], IrType::Void));
         fn_sigs.insert("slang_array_len".into(),      (vec![IrType::Ptr], IrType::I64));
-
-        // ── v15: String operations ────────────────────────────────────
-        for name in &["str_upper", "str_lower", "str_trim", "str_reverse"] {
-            fn_sigs.insert(name.to_string(), (vec![IrType::Ptr], IrType::Ptr));
-        }
-        for name in &["str_contains", "str_starts_with", "str_ends_with"] {
-            fn_sigs.insert(name.to_string(), (vec![IrType::Ptr, IrType::Ptr], IrType::Bool));
-        }
-        fn_sigs.insert("str_char_at".into(),      (vec![IrType::Ptr, IrType::I64], IrType::Ptr));
-        fn_sigs.insert("str_substr".into(),        (vec![IrType::Ptr, IrType::I64, IrType::I64], IrType::Ptr));
-        fn_sigs.insert("str_index_of".into(),      (vec![IrType::Ptr, IrType::Ptr], IrType::I64));
-        fn_sigs.insert("str_replace".into(),       (vec![IrType::Ptr, IrType::Ptr, IrType::Ptr], IrType::Ptr));
-        fn_sigs.insert("str_repeat".into(),        (vec![IrType::Ptr, IrType::I64], IrType::Ptr));
-        fn_sigs.insert("str_split_count".into(),   (vec![IrType::Ptr, IrType::Ptr], IrType::I64));
-        fn_sigs.insert("str_split_get".into(),     (vec![IrType::Ptr, IrType::Ptr, IrType::I64], IrType::Ptr));
-        fn_sigs.insert("to_string_i64".into(),     (vec![IrType::I64], IrType::Ptr));
-        fn_sigs.insert("to_string_f64".into(),     (vec![IrType::F64], IrType::Ptr));
-        fn_sigs.insert("to_string_bool".into(),    (vec![IrType::Bool], IrType::Ptr));
-        fn_sigs.insert("parse_int".into(),         (vec![IrType::Ptr], IrType::I64));
-        fn_sigs.insert("parse_float".into(),       (vec![IrType::Ptr], IrType::F64));
-
-        // ── v15: File I/O ─────────────────────────────────────────────
-        fn_sigs.insert("file_read".into(),         (vec![IrType::Ptr], IrType::Ptr));
-        fn_sigs.insert("file_write".into(),        (vec![IrType::Ptr, IrType::Ptr], IrType::Bool));
-        fn_sigs.insert("file_append".into(),       (vec![IrType::Ptr, IrType::Ptr], IrType::Bool));
-        fn_sigs.insert("file_exists".into(),       (vec![IrType::Ptr], IrType::Bool));
-        fn_sigs.insert("file_delete".into(),       (vec![IrType::Ptr], IrType::Bool));
-        fn_sigs.insert("file_size".into(),         (vec![IrType::Ptr], IrType::I64));
-
-        // ── v15: Map operations ───────────────────────────────────────
-        fn_sigs.insert("map_new".into(),           (vec![], IrType::I64));
-        fn_sigs.insert("map_set".into(),           (vec![IrType::I64, IrType::Ptr, IrType::I64], IrType::Void));
-        fn_sigs.insert("map_get".into(),           (vec![IrType::I64, IrType::Ptr], IrType::I64));
-        fn_sigs.insert("map_has".into(),            (vec![IrType::I64, IrType::Ptr], IrType::Bool));
-        fn_sigs.insert("map_remove".into(),        (vec![IrType::I64, IrType::Ptr], IrType::Void));
-        fn_sigs.insert("map_len".into(),           (vec![IrType::I64], IrType::I64));
-        fn_sigs.insert("map_keys".into(),          (vec![IrType::I64], IrType::Ptr));
-
-        // ── v15: Error handling ───────────────────────────────────────
-        fn_sigs.insert("error_set".into(),         (vec![IrType::I64, IrType::Ptr], IrType::Void));
-        fn_sigs.insert("error_check".into(),       (vec![], IrType::I64));
-        fn_sigs.insert("error_msg".into(),         (vec![], IrType::Ptr));
-        fn_sigs.insert("error_clear".into(),       (vec![], IrType::Void));
-
-        // ── v15: Environment & System ─────────────────────────────────
-        fn_sigs.insert("env_get".into(),           (vec![IrType::Ptr], IrType::Ptr));
-        fn_sigs.insert("sleep_ms".into(),          (vec![IrType::I64], IrType::Void));
-        fn_sigs.insert("eprint".into(),            (vec![IrType::Ptr], IrType::Void));
-        fn_sigs.insert("eprintln".into(),          (vec![IrType::Ptr], IrType::Void));
-        fn_sigs.insert("pid".into(),               (vec![], IrType::I64));
-        fn_sigs.insert("format_int".into(),        (vec![IrType::Ptr, IrType::I64], IrType::Ptr));
-        fn_sigs.insert("format_float".into(),      (vec![IrType::Ptr, IrType::F64], IrType::Ptr));
-
-        // ── v15: JSON ─────────────────────────────────────────────────
-        fn_sigs.insert("json_encode".into(),       (vec![IrType::I64], IrType::Ptr));
-        fn_sigs.insert("json_decode".into(),       (vec![IrType::Ptr], IrType::I64));
-
-        // ── v18: Collection methods (array_push, etc.) ────────────────
-        fn_sigs.insert("array_push".into(),     (vec![IrType::Ptr, IrType::I64], IrType::Ptr));
-        fn_sigs.insert("array_pop".into(),      (vec![IrType::Ptr], IrType::I64));
-        fn_sigs.insert("array_contains".into(), (vec![IrType::Ptr, IrType::I64], IrType::Bool));
-        fn_sigs.insert("array_reverse".into(),  (vec![IrType::Ptr], IrType::Ptr));
-        fn_sigs.insert("array_sort".into(),     (vec![IrType::Ptr], IrType::Ptr));
-        fn_sigs.insert("array_join".into(),     (vec![IrType::Ptr, IrType::Ptr], IrType::Ptr));
-        fn_sigs.insert("array_slice".into(),    (vec![IrType::Ptr, IrType::I64, IrType::I64], IrType::Ptr));
-        fn_sigs.insert("array_find".into(),     (vec![IrType::Ptr, IrType::I64], IrType::I64));
-        fn_sigs.insert("array_map".into(),      (vec![IrType::Ptr, IrType::Ptr], IrType::Ptr));
         fn_sigs.insert("array_filter".into(),   (vec![IrType::Ptr, IrType::Ptr], IrType::Ptr));
-
-        // ── v18: Error handling extensions ────────────────────────────
-        fn_sigs.insert("error_message".into(),  (vec![], IrType::Ptr));
-
-        // ── v18: Format function ──────────────────────────────────────
+        fn_sigs.insert("array_map".into(),      (vec![IrType::Ptr, IrType::Ptr], IrType::Ptr));
         fn_sigs.insert("format".into(),         (vec![IrType::Ptr, IrType::I64], IrType::Ptr));
         fn_sigs.insert("format2".into(),        (vec![IrType::Ptr, IrType::I64, IrType::I64], IrType::Ptr));
-
-        // ── v18: String method wrappers ───────────────────────────────
-        fn_sigs.insert("str_to_upper".into(),   (vec![IrType::Ptr], IrType::Ptr));
-        fn_sigs.insert("str_to_lower".into(),   (vec![IrType::Ptr], IrType::Ptr));
         fn_sigs.insert("str_split".into(),      (vec![IrType::Ptr, IrType::Ptr], IrType::Ptr));
         fn_sigs.insert("str_substring".into(),  (vec![IrType::Ptr, IrType::I64, IrType::I64], IrType::Ptr));
+        fn_sigs.insert("str_to_upper".into(),   (vec![IrType::Ptr], IrType::Ptr));
+        fn_sigs.insert("str_to_lower".into(),   (vec![IrType::Ptr], IrType::Ptr));
 
         Self {
             module: IrModule::new(),
@@ -412,6 +319,8 @@ impl IrBuilder {
             var_struct_types: HashMap::new(),
             loop_stack: Vec::new(),
             module_prefix: Vec::new(),
+            closure_info: HashMap::new(),
+            last_closure_info: None,
         }
     }
 
@@ -623,6 +532,8 @@ impl IrBuilder {
         self.mutable_var_types = HashMap::new();
         self.var_struct_types = HashMap::new();
         self.loop_stack = Vec::new();
+        self.closure_info = HashMap::new();
+        self.last_closure_info = None;
 
         let entry = self.fresh_block();
         let bb = BasicBlock::new(entry);
@@ -699,6 +610,10 @@ impl IrBuilder {
                     self.record_type(v, IrType::I64);
                     v
                 };
+                // v106: If RHS was a lambda, record closure binding for call-site resolution
+                if let Some(closure_info) = self.last_closure_info.take() {
+                    self.closure_info.insert(name.clone(), closure_info);
+                }
                 // Determine var type: prefer annotation, then infer from value
                 let var_ty = if let Some(ta) = ty_annot {
                     self.type_expr_to_ir(ta)
@@ -922,6 +837,12 @@ impl IrBuilder {
                     } else {
                         val
                     }
+                } else if let Some(tag) = self.lookup_enum_variant_tag(name) {
+                    // v107: Unit enum variant (e.g., `Red` → EnumAlloc with tag, no fields)
+                    let v = self.fresh_value();
+                    self.emit(Inst::EnumAlloc { result: v, tag, fields: vec![] });
+                    self.record_type(v, IrType::Ptr);
+                    v
                 } else {
                     // Undefined — produce a zero value
                     let v = self.fresh_value();
@@ -1060,6 +981,36 @@ impl IrBuilder {
                     _ => "<indirect>".to_string(),
                 };
                 let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+
+                // v107: If calling an enum variant constructor, emit EnumAlloc
+                if let Some(tag) = self.lookup_enum_variant_tag(&func_name) {
+                    let v = self.fresh_value();
+                    self.emit(Inst::EnumAlloc { result: v, tag, fields: arg_vals });
+                    self.record_type(v, IrType::Ptr);
+                    return v;
+                }
+
+                // v106: If calling a closure variable, resolve to the lambda function
+                // and prepend captured values as extra arguments
+                if let Some((lambda_name, capture_vals)) = self.closure_info.get(&func_name) {
+                    let lambda_name = lambda_name.clone();
+                    let capture_vals = capture_vals.clone();
+                    let ret_ty = self.fn_sigs.get(&lambda_name)
+                        .map(|(_, r)| r.clone())
+                        .unwrap_or(IrType::I64);
+                    let mut all_args = capture_vals;
+                    all_args.extend(arg_vals);
+                    let v = self.fresh_value();
+                    self.record_type(v, ret_ty.clone());
+                    self.emit(Inst::Call {
+                        result: v,
+                        func: lambda_name,
+                        args: all_args,
+                        ret_ty,
+                    });
+                    return v;
+                }
+
                 let ret_ty = self.fn_sigs.get(&func_name)
                     .map(|(_, r)| r.clone())
                     .unwrap_or(IrType::I64);
@@ -1540,10 +1491,12 @@ impl IrBuilder {
                 let result = self.fresh_value();
                 self.emit(Inst::ClosureAlloc {
                     result,
-                    func: anon_name,
-                    captures: capture_vals,
+                    func: anon_name.clone(),
+                    captures: capture_vals.clone(),
                 });
                 self.record_type(result, IrType::Ptr);
+                // v106: Record closure info for call-site resolution
+                self.last_closure_info = Some((anon_name, capture_vals));
                 result
             }
 
@@ -1633,18 +1586,91 @@ impl IrBuilder {
                             });
                         }
                         ast::Pattern::Ident(name, _) => {
-                            // Ident pattern: always matches, binds subject to name.
-                            self.locals.insert(name.clone(), subj);
-                            self.emit(Inst::Jump { target: body_bb });
+                            // v107: Check if this ident is actually a unit enum variant
+                            if let Some(tag) = self.lookup_enum_variant_tag(name) {
+                                let subj_tag = self.fresh_value();
+                                self.emit(Inst::EnumTag { result: subj_tag, enum_val: subj });
+                                self.record_type(subj_tag, IrType::I64);
+
+                                let expected_tag = self.fresh_value();
+                                self.emit(Inst::IConst { result: expected_tag, value: tag as i64, ty: IrType::I64 });
+                                self.record_type(expected_tag, IrType::I64);
+
+                                let cmp = self.fresh_value();
+                                self.emit(Inst::ICmp { result: cmp, cond: IrCmp::Eq, lhs: subj_tag, rhs: expected_tag });
+
+                                self.emit(Inst::Branch {
+                                    cond: cmp,
+                                    then_bb: body_bb,
+                                    else_bb: fail_bb,
+                                });
+                            } else {
+                                // Regular ident pattern: always matches, binds subject to name.
+                                self.locals.insert(name.clone(), subj);
+                                self.emit(Inst::Jump { target: body_bb });
+                            }
                         }
                         ast::Pattern::Wildcard(_) => {
                             // Wildcard: always matches.
                             self.emit(Inst::Jump { target: body_bb });
                         }
-                        ast::Pattern::Variant { .. } | ast::Pattern::Struct { .. }
+                        ast::Pattern::Variant { name, fields, .. } => {
+                            // v107: Match on enum variant by extracting tag and comparing
+                            if let Some(tag) = self.lookup_enum_variant_tag(name) {
+                                // Extract tag from subject
+                                let subj_tag = self.fresh_value();
+                                self.emit(Inst::EnumTag { result: subj_tag, enum_val: subj });
+                                self.record_type(subj_tag, IrType::I64);
+
+                                let expected_tag = self.fresh_value();
+                                self.emit(Inst::IConst { result: expected_tag, value: tag as i64, ty: IrType::I64 });
+                                self.record_type(expected_tag, IrType::I64);
+
+                                let tag_cmp = self.fresh_value();
+                                self.emit(Inst::ICmp { result: tag_cmp, cond: IrCmp::Eq, lhs: subj_tag, rhs: expected_tag });
+                                self.record_type(tag_cmp, IrType::Bool);
+
+                                self.emit(Inst::Branch {
+                                    cond: tag_cmp,
+                                    then_bb: body_bb,
+                                    else_bb: fail_bb,
+                                });
+
+                                // In the body block, bind variant fields
+                                self.switch_block(body_bb);
+                                for (fi, fpat) in fields.iter().enumerate() {
+                                    if let ast::Pattern::Ident(fname, _) = fpat {
+                                        let fval = self.fresh_value();
+                                        self.emit(Inst::EnumField {
+                                            result: fval,
+                                            enum_val: subj,
+                                            field_index: fi as u32,
+                                            ty: IrType::I64,
+                                        });
+                                        self.record_type(fval, IrType::I64);
+                                        self.locals.insert(fname.clone(), fval);
+                                    }
+                                }
+                                // Don't switch_block again — we're already in body_bb,
+                                // the body lowering below will use it.
+                                // Skip the body_bb switch below:
+                                let body_val = self.lower_expr(&arm.body);
+                                let body_ty = self.infer_type(body_val);
+                                if first_arm_ty.is_none() {
+                                    first_arm_ty = Some(body_ty);
+                                }
+                                let pred_bb = self.current_blocks[self.current_block].id;
+                                self.emit(Inst::Jump { target: merge_bb });
+                                phi_incoming.push((body_val, pred_bb));
+                                continue; // Skip the common body handling below
+                            } else {
+                                // Unknown variant — treat as wildcard
+                                self.emit(Inst::Jump { target: body_bb });
+                            }
+                        }
+                        ast::Pattern::Struct { .. }
                         | ast::Pattern::Or { .. } | ast::Pattern::Tuple { .. } => {
-                            // Phase 7 scaffolding: variant/struct/or/tuple patterns
-                            // treated as wildcard for now.
+                            // Struct/or/tuple patterns treated as wildcard for now.
                             self.emit(Inst::Jump { target: body_bb });
                         }
                     }
@@ -1833,6 +1859,18 @@ impl IrBuilder {
                 v
             }
         }
+    }
+
+    /// v107: Look up the tag index for an enum variant name across all registered enums.
+    fn lookup_enum_variant_tag(&self, name: &str) -> Option<u32> {
+        for (_enum_name, variants) in &self.enum_defs {
+            for (i, (vname, _field_count)) in variants.iter().enumerate() {
+                if vname == name {
+                    return Some(i as u32);
+                }
+            }
+        }
+        None
     }
 
     /// v18: Collect free variable names referenced in an expression that are
@@ -2120,6 +2158,93 @@ fn main() -> i64 {
         let module = lower_src("fn main() -> i64 { let f = |x: i64| x * 2; 0 }");
         let has_lambda = module.functions.iter().any(|f| f.name.starts_with("__lambda"));
         assert!(has_lambda, "Expected a lambda function");
+    }
+
+    // ── v106: Closure with captures — call resolution tests ──────────
+
+    #[test]
+    fn test_v106_closure_call_resolves_to_lambda() {
+        // When calling a closure variable, the IR should emit a Call to the lambda function
+        // instead of a call to the variable name
+        let module = lower_src("fn main() -> i64 { let a: i64 = 10; let f = |x: i64| a + x; f(5) }");
+        let main_fn = module.functions.iter().find(|f| f.name == "main").unwrap();
+        let has_lambda_call = main_fn.blocks.iter().any(|b| {
+            b.insts.iter().any(|inst| {
+                if let Inst::Call { func, .. } = inst {
+                    func.starts_with("__lambda")
+                } else {
+                    false
+                }
+            })
+        });
+        assert!(has_lambda_call, "Expected main to call __lambda_* function");
+    }
+
+    #[test]
+    fn test_v106_closure_captures_prepended() {
+        // Lambda with capture should have captures prepended as params
+        let module = lower_src("fn main() -> i64 { let a: i64 = 10; let f = |x: i64| a + x; f(5) }");
+        let lambda_fn = module.functions.iter().find(|f| f.name.starts_with("__lambda")).unwrap();
+        // Lambda should have 2 params: captured 'a' + explicit 'x'
+        assert_eq!(lambda_fn.params.len(), 2, "Lambda should have captured var + explicit param");
+    }
+
+    // ── v107: Enum IR lowering tests ──────────────────────────────────
+
+    #[test]
+    fn test_v107_enum_alloc_emitted() {
+        let module = lower_src("enum Color { Red, Green, Blue } fn main() -> i64 { let c: Color = Red; 0 }");
+        let main_fn = module.functions.iter().find(|f| f.name == "main").unwrap();
+        let has_enum_alloc = main_fn.blocks.iter().any(|b| {
+            b.insts.iter().any(|inst| matches!(inst, Inst::EnumAlloc { .. }))
+        });
+        assert!(has_enum_alloc, "Expected EnumAlloc instruction for unit variant");
+    }
+
+    #[test]
+    fn test_v107_enum_tag_in_match() {
+        let module = lower_src(r#"
+enum Color { Red, Green, Blue }
+fn main() -> i64 {
+    let c: Color = Red;
+    match c { Red => 1, Green => 2, Blue => 3 }
+}"#);
+        let main_fn = module.functions.iter().find(|f| f.name == "main").unwrap();
+        let has_enum_tag = main_fn.blocks.iter().any(|b| {
+            b.insts.iter().any(|inst| matches!(inst, Inst::EnumTag { .. }))
+        });
+        assert!(has_enum_tag, "Expected EnumTag instruction in match on enum");
+    }
+
+    #[test]
+    fn test_v107_enum_payload_variant_emitted() {
+        let module = lower_src("enum Shape { Circle(i64), Square(i64) } fn main() -> i64 { let s: Shape = Circle(42); 0 }");
+        let main_fn = module.functions.iter().find(|f| f.name == "main").unwrap();
+        let has_enum_alloc = main_fn.blocks.iter().any(|b| {
+            b.insts.iter().any(|inst| {
+                if let Inst::EnumAlloc { fields, .. } = inst {
+                    fields.len() == 1 // Circle(42) has 1 field
+                } else {
+                    false
+                }
+            })
+        });
+        assert!(has_enum_alloc, "Expected EnumAlloc with 1 field for Circle(42)");
+    }
+
+    #[test]
+    fn test_v107_enum_field_extraction_in_match() {
+        let module = lower_src(r#"
+enum Shape { Circle(i64), Square(i64) }
+fn main() -> i64 {
+    let s: Shape = Circle(42);
+    match s { Circle(r) => r, Square(side) => side }
+}"#);
+        let main_fn = module.functions.iter().find(|f| f.name == "main").unwrap();
+        let has_enum_field = main_fn.blocks.iter().any(|b| {
+            b.insts.iter().any(|inst| matches!(inst, Inst::EnumField { .. }))
+        });
+        assert!(has_enum_field, "Expected EnumField instruction for payload extraction in match");
     }
 
 }

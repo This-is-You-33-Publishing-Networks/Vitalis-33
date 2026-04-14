@@ -11,9 +11,8 @@
 //! - **Tuning**: Heap growth factor, nursery size, concurrent marking, pause target
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 // ── Tri-Color Marking ────────────────────────────────────────────────
 
@@ -470,7 +469,7 @@ impl GcHeap {
             }
         }
 
-        let collected = self.sweep();
+        let _collected = self.sweep();
 
         // Reset nursery counter.
         self.nursery_bytes = self.objects.iter()
@@ -494,7 +493,7 @@ impl GcHeap {
         self.stats.old_collections += 1;
 
         self.mark();
-        let collected = self.sweep();
+        let _collected = self.sweep();
 
         // Compact: update fragmentation ratio.
         let total_bytes: usize = self.objects.values().map(|o| o.size_bytes).sum();

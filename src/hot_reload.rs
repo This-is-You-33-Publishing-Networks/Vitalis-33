@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use std::fmt;
 
-use crate::incremental::{IncrementalCache, CacheState, ContentHash, DepGraph};
+use crate::incremental::{IncrementalCache, CacheState, DepGraph};
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Hot-Reload Configuration

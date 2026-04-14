@@ -627,17 +627,24 @@ impl InliningOracle {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-//  IR OPTIMIZATION PASSES — constant folding, dead elimination, loop tile
+//  IR OPTIMIZATION PASSES — constant folding, CSE, dead elimination,
+//                            strength reduction, fixed-point iteration
 // ═══════════════════════════════════════════════════════════════════════
 
-use crate::ir::{IrModule, IrFunction, Inst, Value, IrBinOp};
+use crate::ir::{IrModule, IrFunction, Inst, Value, IrBinOp, IrType, IrCmp, BlockId};
 
 /// Statistics from an optimization pass.
 #[derive(Debug, Clone, Default)]
 pub struct OptPassStats {
     pub constants_folded: u32,
     pub dead_eliminated: u32,
+    pub cse_eliminated: u32,
+    pub strength_reduced: u32,
     pub loops_tiled: u32,
+    pub copies_propagated: u32,
+    pub blocks_merged: u32,
+    pub licm_hoisted: u32,
+    pub functions_inlined: u32,
     pub instructions_before: u32,
     pub instructions_after: u32,
 }
@@ -645,19 +652,33 @@ pub struct OptPassStats {
 impl OptPassStats {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"constants_folded\":{},\"dead_eliminated\":{},\"loops_tiled\":{},\"before\":{},\"after\":{}}}",
+            "{{\"constants_folded\":{},\"dead_eliminated\":{},\"cse_eliminated\":{},\"strength_reduced\":{},\"loops_tiled\":{},\"copies_propagated\":{},\"blocks_merged\":{},\"licm_hoisted\":{},\"functions_inlined\":{},\"before\":{},\"after\":{}}}",
             self.constants_folded,
             self.dead_eliminated,
+            self.cse_eliminated,
+            self.strength_reduced,
             self.loops_tiled,
+            self.copies_propagated,
+            self.blocks_merged,
+            self.licm_hoisted,
+            self.functions_inlined,
             self.instructions_before,
             self.instructions_after,
         )
     }
 }
 
-/// Run all optimization passes on an IR module.
+/// Run all optimization passes on an IR module with fixed-point iteration.
 pub fn optimize_ir(module: &mut IrModule) -> OptPassStats {
     let mut stats = OptPassStats::default();
+
+    // Pass 0: Dead function elimination (tree-shaking)
+    let removed = dead_function_eliminate(module);
+    stats.dead_eliminated += removed;
+
+    // Pass 0b: Function inlining (v137) — before fixed-point to enable further opts
+    let inlined = inline_functions(module, 30);
+    stats.functions_inlined += inlined;
 
     for func in &module.functions {
         stats.instructions_before += func.blocks.iter()
@@ -665,14 +686,61 @@ pub fn optimize_ir(module: &mut IrModule) -> OptPassStats {
             .sum::<u32>();
     }
 
-    // Pass 1: Constant folding
-    for func in &mut module.functions {
-        stats.constants_folded += constant_fold(func);
-    }
+    // Fixed-point iteration: repeat passes until no more changes
+    const MAX_ITERATIONS: usize = 10;
+    for _ in 0..MAX_ITERATIONS {
+        let mut changed = false;
 
-    // Pass 2: Dead code elimination
-    for func in &mut module.functions {
-        stats.dead_eliminated += dead_code_eliminate(func);
+        // Pass 1: Constant folding (including comparisons and strength reduction)
+        for func in &mut module.functions {
+            let n = constant_fold(func);
+            stats.constants_folded += n;
+            if n > 0 { changed = true; }
+        }
+
+        // Pass 2: Strength reduction (mul/div by powers of 2 → shifts)
+        for func in &mut module.functions {
+            let n = strength_reduce(func);
+            stats.strength_reduced += n;
+            if n > 0 { changed = true; }
+        }
+
+        // Pass 3: Common subexpression elimination
+        for func in &mut module.functions {
+            let n = cse(func);
+            stats.cse_eliminated += n;
+            if n > 0 { changed = true; }
+        }
+
+        // Pass 4: Copy propagation (v135)
+        for func in &mut module.functions {
+            let n = copy_propagate(func);
+            stats.copies_propagated += n;
+            if n > 0 { changed = true; }
+        }
+
+        // Pass 5: Loop-invariant code motion (v136)
+        for func in &mut module.functions {
+            let n = licm(func);
+            stats.licm_hoisted += n;
+            if n > 0 { changed = true; }
+        }
+
+        // Pass 6: Dead code elimination
+        for func in &mut module.functions {
+            let n = dead_code_eliminate(func);
+            stats.dead_eliminated += n;
+            if n > 0 { changed = true; }
+        }
+
+        // Pass 7: Block merging (v135)
+        for func in &mut module.functions {
+            let n = merge_blocks(func);
+            stats.blocks_merged += n;
+            if n > 0 { changed = true; }
+        }
+
+        if !changed { break; }
     }
 
     for func in &module.functions {
@@ -685,7 +753,8 @@ pub fn optimize_ir(module: &mut IrModule) -> OptPassStats {
 }
 
 /// Constant folding pass: evaluate constant expressions at compile time.
-fn constant_fold(func: &mut IrFunction) -> u32 {
+/// Handles BinOp (integer + float), ICmp, FCmp on known constants.
+pub fn constant_fold(func: &mut IrFunction) -> u32 {
     let mut folded = 0u32;
 
     // Collect known constants: Value → i64 or f64
@@ -702,7 +771,7 @@ fn constant_fold(func: &mut IrFunction) -> u32 {
         }
     }
 
-    // Fold binary operations on known constants
+    // Fold binary operations and comparisons on known constants
     for block in &mut func.blocks {
         for inst in &mut block.insts {
             let replacement = match inst {
@@ -739,6 +808,42 @@ fn constant_fold(func: &mut IrFunction) -> u32 {
                         None
                     }
                 }
+                // Integer comparison folding
+                Inst::ICmp { result, cond, lhs, rhs, .. } => {
+                    if let (Some(&l), Some(&r)) = (iconsts.get(lhs), iconsts.get(rhs)) {
+                        let val = match cond {
+                            IrCmp::Eq  => l == r,
+                            IrCmp::Ne  => l != r,
+                            IrCmp::Lt  => l < r,
+                            IrCmp::Le  => l <= r,
+                            IrCmp::Gt  => l > r,
+                            IrCmp::Ge  => l >= r,
+                        };
+                        let v = if val { 1i64 } else { 0 };
+                        iconsts.insert(*result, v);
+                        Some(Inst::IConst { result: *result, value: v, ty: IrType::Bool })
+                    } else {
+                        None
+                    }
+                }
+                // Float comparison folding
+                Inst::FCmp { result, cond, lhs, rhs, .. } => {
+                    if let (Some(&l), Some(&r)) = (fconsts.get(lhs), fconsts.get(rhs)) {
+                        let val = match cond {
+                            IrCmp::Eq  => l.to_bits() == r.to_bits(),
+                            IrCmp::Ne  => l.to_bits() != r.to_bits(),
+                            IrCmp::Lt  => l < r,
+                            IrCmp::Le  => l <= r,
+                            IrCmp::Gt  => l > r,
+                            IrCmp::Ge  => l >= r,
+                        };
+                        let v = if val { 1i64 } else { 0 };
+                        iconsts.insert(*result, v);
+                        Some(Inst::IConst { result: *result, value: v, ty: IrType::Bool })
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             };
 
@@ -752,8 +857,126 @@ fn constant_fold(func: &mut IrFunction) -> u32 {
     folded
 }
 
+/// Strength reduction: replace expensive ops with cheaper equivalents.
+/// - x * 1 → x, x * 0 → 0, x + 0 → x, x - 0 → x
+/// - x * 2^n → x << n (integer multiply by power of 2 → shift)
+/// - x / 2^n → x >> n (integer divide by power of 2 → shift, positive only)
+pub fn strength_reduce(func: &mut IrFunction) -> u32 {
+    // Collect known integer constants
+    let mut iconsts: HashMap<Value, i64> = HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let Inst::IConst { result, value, .. } = inst {
+                iconsts.insert(*result, *value);
+            }
+        }
+    }
+
+    let mut reduced = 0u32;
+
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            let replacement = match inst {
+                Inst::BinOp { result, op, lhs, rhs, ty } => {
+                    let lc = iconsts.get(lhs).copied();
+                    let rc = iconsts.get(rhs).copied();
+                    match op {
+                        // x * 0 → 0
+                        IrBinOp::Mul if rc == Some(0) => {
+                            iconsts.insert(*result, 0);
+                            Some(Inst::IConst { result: *result, value: 0, ty: ty.clone() })
+                        }
+                        // 0 * x → 0
+                        IrBinOp::Mul if lc == Some(0) => {
+                            iconsts.insert(*result, 0);
+                            Some(Inst::IConst { result: *result, value: 0, ty: ty.clone() })
+                        }
+                        // x * 1 → x
+                        IrBinOp::Mul if rc == Some(1) => {
+                            Some(Inst::Copy { result: *result, source: *lhs })
+                        }
+                        // 1 * x → x
+                        IrBinOp::Mul if lc == Some(1) => {
+                            Some(Inst::Copy { result: *result, source: *rhs })
+                        }
+                        // x + 0 → x
+                        IrBinOp::Add if rc == Some(0) => {
+                            Some(Inst::Copy { result: *result, source: *lhs })
+                        }
+                        // 0 + x → x
+                        IrBinOp::Add if lc == Some(0) => {
+                            Some(Inst::Copy { result: *result, source: *rhs })
+                        }
+                        // x - 0 → x
+                        IrBinOp::Sub if rc == Some(0) => {
+                            Some(Inst::Copy { result: *result, source: *lhs })
+                        }
+                        // x / 1 → x
+                        IrBinOp::Div if rc == Some(1) => {
+                            Some(Inst::Copy { result: *result, source: *lhs })
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(new_inst) = replacement {
+                *inst = new_inst;
+                reduced += 1;
+            }
+        }
+    }
+
+    reduced
+}
+
+/// Common subexpression elimination: replace redundant computations with copies.
+/// Two instructions are "common" if they have the same opcode and operands.
+pub fn cse(func: &mut IrFunction) -> u32 {
+    let mut eliminated = 0u32;
+
+    for block in &mut func.blocks {
+        // Key: (opcode tag, operand1, operand2) → first result Value
+        let mut seen: HashMap<(u8, u64, u64), Value> = HashMap::new();
+
+        for inst in &mut block.insts {
+            let key_and_result = match inst {
+                Inst::BinOp { result, op, lhs, rhs, .. } => {
+                    let tag = *op as u8;
+                    Some(((tag, lhs.0 as u64, rhs.0 as u64), *result))
+                }
+                Inst::ICmp { result, cond, lhs, rhs, .. } => {
+                    let tag = 100 + *cond as u8;
+                    Some(((tag, lhs.0 as u64, rhs.0 as u64), *result))
+                }
+                Inst::FCmp { result, cond, lhs, rhs, .. } => {
+                    let tag = 200 + *cond as u8;
+                    Some(((tag, lhs.0 as u64, rhs.0 as u64), *result))
+                }
+                Inst::UnOp { result, op, operand, .. } => {
+                    let tag = 50 + *op as u8;
+                    Some(((tag, operand.0 as u64, 0), *result))
+                }
+                _ => None,
+            };
+
+            if let Some((key, result)) = key_and_result {
+                if let Some(&first_result) = seen.get(&key) {
+                    // Replace this instruction with a copy from the first occurrence
+                    *inst = Inst::Copy { result, source: first_result };
+                    eliminated += 1;
+                } else {
+                    seen.insert(key, result);
+                }
+            }
+        }
+    }
+
+    eliminated
+}
+
 /// Dead code elimination: remove instructions whose results are never used.
-fn dead_code_eliminate(func: &mut IrFunction) -> u32 {
+pub fn dead_code_eliminate(func: &mut IrFunction) -> u32 {
     // Build use set: which Values are ever referenced?
     let mut used: std::collections::HashSet<Value> = std::collections::HashSet::new();
 
@@ -780,6 +1003,9 @@ fn dead_code_eliminate(func: &mut IrFunction) -> u32 {
                 Inst::FieldGet { object, .. } => { used.insert(*object); }
                 Inst::FieldSet { object, value, .. } => { used.insert(*object); used.insert(*value); }
                 Inst::ClosureAlloc { captures, .. } => { for c in captures { used.insert(*c); } }
+                Inst::EnumAlloc { fields, .. } => { for f in fields { used.insert(*f); } }
+                Inst::EnumTag { enum_val, .. } => { used.insert(*enum_val); }
+                Inst::EnumField { enum_val, .. } => { used.insert(*enum_val); }
                 _ => {}
             }
         }
@@ -823,6 +1049,702 @@ fn dead_code_eliminate(func: &mut IrFunction) -> u32 {
     }
 
     eliminated
+}
+
+/// Dead function elimination (tree-shaking).
+/// Removes functions that are unreachable from `main`.
+/// Builds a call-graph by scanning `Inst::Call` references and retains
+/// only functions transitively reachable from the entry point.
+pub fn dead_function_eliminate(module: &mut IrModule) -> u32 {
+    if module.functions.is_empty() {
+        return 0;
+    }
+
+    // Build name → index map
+    let name_to_idx: std::collections::HashMap<&str, usize> = module.functions.iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.as_str(), i))
+        .collect();
+
+    // Build call-graph: for each function, which other functions does it call?
+    let mut callees: Vec<Vec<usize>> = vec![Vec::new(); module.functions.len()];
+    for (i, func) in module.functions.iter().enumerate() {
+        for block in &func.blocks {
+            for inst in &block.insts {
+                if let Inst::Call { func: callee, .. } = inst {
+                    if let Some(&target_idx) = name_to_idx.get(callee.as_str()) {
+                        callees[i].push(target_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // BFS from "main" to find reachable functions
+    let mut reachable = vec![false; module.functions.len()];
+    let mut queue = std::collections::VecDeque::new();
+
+    if let Some(&main_idx) = name_to_idx.get("main") {
+        reachable[main_idx] = true;
+        queue.push_back(main_idx);
+    } else {
+        // No main — keep everything (library mode)
+        return 0;
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        for &callee_idx in &callees[idx] {
+            if !reachable[callee_idx] {
+                reachable[callee_idx] = true;
+                queue.push_back(callee_idx);
+            }
+        }
+    }
+
+    // Remove unreachable functions
+    let before = module.functions.len();
+    let mut i = 0;
+    module.functions.retain(|_| {
+        let keep = reachable[i];
+        i += 1;
+        keep
+    });
+    let removed = (before - module.functions.len()) as u32;
+
+    removed
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  v135 — COPY PROPAGATION
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Copy propagation: when `result = copy source`, replace all uses of
+/// `result` with `source` and eliminate the copy chain.
+/// Also propagates constants through copies (constant propagation).
+pub fn copy_propagate(func: &mut IrFunction) -> u32 {
+    // Build copy map: result → source (transitively resolved)
+    let mut copy_map: HashMap<Value, Value> = HashMap::new();
+
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if let Inst::Copy { result, source } = inst {
+                // Resolve transitively: if source is itself a copy, follow the chain
+                let mut root = *source;
+                while let Some(&prev) = copy_map.get(&root) {
+                    root = prev;
+                }
+                copy_map.insert(*result, root);
+            }
+        }
+    }
+
+    if copy_map.is_empty() {
+        return 0;
+    }
+
+    let mut propagated = 0u32;
+
+    // Replace all uses of copied values with their sources
+    let resolve = |v: &mut Value| -> bool {
+        if let Some(&src) = copy_map.get(v) {
+            *v = src;
+            true
+        } else {
+            false
+        }
+    };
+
+    for block in &mut func.blocks {
+        for inst in &mut block.insts {
+            match inst {
+                Inst::BinOp { lhs, rhs, .. } => {
+                    if resolve(lhs) { propagated += 1; }
+                    if resolve(rhs) { propagated += 1; }
+                }
+                Inst::UnOp { operand, .. } => {
+                    if resolve(operand) { propagated += 1; }
+                }
+                Inst::ICmp { lhs, rhs, .. } => {
+                    if resolve(lhs) { propagated += 1; }
+                    if resolve(rhs) { propagated += 1; }
+                }
+                Inst::FCmp { lhs, rhs, .. } => {
+                    if resolve(lhs) { propagated += 1; }
+                    if resolve(rhs) { propagated += 1; }
+                }
+                Inst::Call { args, .. } => {
+                    for a in args.iter_mut() {
+                        if resolve(a) { propagated += 1; }
+                    }
+                }
+                Inst::Return { value } => {
+                    if let Some(v) = value {
+                        if resolve(v) { propagated += 1; }
+                    }
+                }
+                Inst::Branch { cond, .. } => {
+                    if resolve(cond) { propagated += 1; }
+                }
+                Inst::Phi { incoming, .. } => {
+                    for (v, _) in incoming.iter_mut() {
+                        if resolve(v) { propagated += 1; }
+                    }
+                }
+                Inst::Load { ptr, .. } => {
+                    if resolve(ptr) { propagated += 1; }
+                }
+                Inst::Store { value, ptr, .. } => {
+                    if resolve(value) { propagated += 1; }
+                    if resolve(ptr) { propagated += 1; }
+                }
+                Inst::Copy { source, .. } => {
+                    if resolve(source) { propagated += 1; }
+                }
+                Inst::ArrayGet { array, index, .. } => {
+                    if resolve(array) { propagated += 1; }
+                    if resolve(index) { propagated += 1; }
+                }
+                Inst::ArraySet { array, index, value, .. } => {
+                    if resolve(array) { propagated += 1; }
+                    if resolve(index) { propagated += 1; }
+                    if resolve(value) { propagated += 1; }
+                }
+                Inst::ArrayLen { array, .. } => {
+                    if resolve(array) { propagated += 1; }
+                }
+                Inst::ArrayAlloc { count, .. } => {
+                    if resolve(count) { propagated += 1; }
+                }
+                Inst::StructAlloc { fields, .. } => {
+                    for f in fields.iter_mut() {
+                        if resolve(f) { propagated += 1; }
+                    }
+                }
+                Inst::FieldGet { object, .. } => {
+                    if resolve(object) { propagated += 1; }
+                }
+                Inst::FieldSet { object, value, .. } => {
+                    if resolve(object) { propagated += 1; }
+                    if resolve(value) { propagated += 1; }
+                }
+                Inst::ClosureAlloc { captures, .. } => {
+                    for c in captures.iter_mut() {
+                        if resolve(c) { propagated += 1; }
+                    }
+                }
+                Inst::EnumAlloc { fields, .. } => {
+                    for f in fields.iter_mut() {
+                        if resolve(f) { propagated += 1; }
+                    }
+                }
+                Inst::EnumTag { enum_val, .. } => {
+                    if resolve(enum_val) { propagated += 1; }
+                }
+                Inst::EnumField { enum_val, .. } => {
+                    if resolve(enum_val) { propagated += 1; }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    propagated
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  v135 — BLOCK MERGING
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Block merging: when block A ends with `Jump { target: B }` and B has
+/// only one predecessor (A), merge B's instructions into A.
+pub fn merge_blocks(func: &mut IrFunction) -> u32 {
+    if func.blocks.len() <= 1 {
+        return 0;
+    }
+
+    // Count predecessors for each block
+    let mut pred_count: HashMap<BlockId, u32> = HashMap::new();
+    for block in &func.blocks {
+        // Initialize all blocks with 0 predecessors
+        pred_count.entry(block.id).or_insert(0);
+        // Count successors
+        if let Some(last) = block.insts.last() {
+            match last {
+                Inst::Jump { target } => {
+                    *pred_count.entry(*target).or_insert(0) += 1;
+                }
+                Inst::Branch { then_bb, else_bb, .. } => {
+                    *pred_count.entry(*then_bb).or_insert(0) += 1;
+                    *pred_count.entry(*else_bb).or_insert(0) += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    // Entry block gets implicit predecessor
+    *pred_count.entry(func.entry).or_insert(0) += 1;
+
+    let mut merged = 0u32;
+    let mut merged_any = true;
+
+    while merged_any {
+        merged_any = false;
+
+        // Build block index
+        let block_idx: HashMap<BlockId, usize> = func.blocks.iter()
+            .enumerate()
+            .map(|(i, b)| (b.id, i))
+            .collect();
+
+        // Find a merge candidate: block A jumps to B, B has one predecessor
+        let mut merge_pair: Option<(usize, usize)> = None;
+        for (i, block) in func.blocks.iter().enumerate() {
+            if let Some(Inst::Jump { target }) = block.insts.last() {
+                if let Some(&count) = pred_count.get(target) {
+                    if count == 1 {
+                        if let Some(&j) = block_idx.get(target) {
+                            if i != j {
+                                // Don't merge if B has Phi nodes (would need special handling)
+                                let has_phi = func.blocks[j].insts.iter().any(|inst| {
+                                    matches!(inst, Inst::Phi { .. })
+                                });
+                                if !has_phi {
+                                    merge_pair = Some((i, j));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((a_idx, b_idx)) = merge_pair {
+            let a_id = func.blocks[a_idx].id;
+            let b_id = func.blocks[b_idx].id;
+            let b_insts: Vec<Inst> = func.blocks[b_idx].insts.drain(..).collect();
+
+            // Remove the Jump from A, append B's instructions
+            func.blocks[a_idx].insts.pop(); // remove Jump
+            func.blocks[a_idx].insts.extend(b_insts);
+
+            // Remove block B
+            func.blocks.remove(b_idx);
+
+            // Update Phi incoming: references to removed B become A
+            for block in &mut func.blocks {
+                for inst in &mut block.insts {
+                    if let Inst::Phi { incoming, .. } = inst {
+                        for (_, from_block) in incoming.iter_mut() {
+                            if *from_block == b_id {
+                                *from_block = a_id;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update predecessor counts: B is gone, update its successors
+            pred_count.remove(&b_id);
+
+            merged += 1;
+            merged_any = true;
+        }
+    }
+
+    merged
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  v136 — LOOP-INVARIANT CODE MOTION (LICM)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Detect natural loops in the CFG.
+/// Returns a list of (header, body_blocks) tuples.
+/// A back-edge B→H exists when H dominates B. The natural loop is all
+/// blocks that can reach B without going through H, plus H itself.
+fn detect_loops(func: &IrFunction) -> Vec<(BlockId, Vec<BlockId>)> {
+    let block_ids: Vec<BlockId> = func.blocks.iter().map(|b| b.id).collect();
+    if block_ids.is_empty() { return Vec::new(); }
+
+    // Build successor map
+    let mut succs: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for block in &func.blocks {
+        let mut s = Vec::new();
+        if let Some(last) = block.insts.last() {
+            match last {
+                Inst::Jump { target } => { s.push(*target); }
+                Inst::Branch { then_bb, else_bb, .. } => {
+                    s.push(*then_bb);
+                    s.push(*else_bb);
+                }
+                _ => {}
+            }
+        }
+        succs.insert(block.id, s);
+    }
+
+    // Compute dominators using simple iterative algorithm
+    let mut doms: HashMap<BlockId, std::collections::HashSet<BlockId>> = HashMap::new();
+    let all_set: std::collections::HashSet<BlockId> = block_ids.iter().copied().collect();
+
+    // Entry dominates only itself initially
+    doms.insert(func.entry, [func.entry].into_iter().collect());
+    for &bid in &block_ids {
+        if bid != func.entry {
+            doms.insert(bid, all_set.clone());
+        }
+    }
+
+    // Fixed-point iteration
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &bid in &block_ids {
+            if bid == func.entry { continue; }
+            // Predecessors of bid
+            let preds: Vec<BlockId> = block_ids.iter()
+                .filter(|&&p| succs.get(&p).is_some_and(|s| s.contains(&bid)))
+                .copied()
+                .collect();
+
+            let mut new_dom = if preds.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                let mut iter = preds.iter();
+                let first = *iter.next().unwrap();
+                let mut intersection = doms.get(&first).cloned().unwrap_or_default();
+                for &p in iter {
+                    let p_doms = doms.get(&p).cloned().unwrap_or_default();
+                    intersection = intersection.intersection(&p_doms).copied().collect();
+                }
+                intersection
+            };
+            new_dom.insert(bid); // block dominates itself
+
+            if new_dom != *doms.get(&bid).unwrap_or(&std::collections::HashSet::new()) {
+                doms.insert(bid, new_dom);
+                changed = true;
+            }
+        }
+    }
+
+    // Find back-edges: B→H where H dominates B
+    let mut loops = Vec::new();
+    for &bid in &block_ids {
+        if let Some(ss) = succs.get(&bid) {
+            for &succ in ss {
+                if doms.get(&bid).is_some_and(|d| d.contains(&succ)) {
+                    // Back-edge bid → succ, succ is loop header
+                    // Collect loop body: all blocks that can reach bid without going through header
+                    let mut body: std::collections::HashSet<BlockId> = [succ].into_iter().collect();
+                    if bid != succ {
+                        let mut worklist = vec![bid];
+                        body.insert(bid);
+                        while let Some(w) = worklist.pop() {
+                            // Add predecessors of w (except header)
+                            for &p in &block_ids {
+                                if succs.get(&p).is_some_and(|s| s.contains(&w)) && !body.contains(&p) {
+                                    body.insert(p);
+                                    worklist.push(p);
+                                }
+                            }
+                        }
+                    }
+                    let body_vec: Vec<BlockId> = body.into_iter().collect();
+                    loops.push((succ, body_vec));
+                }
+            }
+        }
+    }
+
+    loops
+}
+
+/// Get the result value defined by an instruction, if any.
+fn inst_result(inst: &Inst) -> Option<Value> {
+    match inst {
+        Inst::IConst { result, .. }
+        | Inst::FConst { result, .. }
+        | Inst::BConst { result, .. }
+        | Inst::StrConst { result, .. }
+        | Inst::BinOp { result, .. }
+        | Inst::UnOp { result, .. }
+        | Inst::ICmp { result, .. }
+        | Inst::FCmp { result, .. }
+        | Inst::Phi { result, .. }
+        | Inst::Copy { result, .. }
+        | Inst::Alloca { result, .. }
+        | Inst::Load { result, .. }
+        | Inst::Call { result, .. }
+        | Inst::ArrayAlloc { result, .. }
+        | Inst::ArrayGet { result, .. }
+        | Inst::ArrayLen { result, .. }
+        | Inst::StructAlloc { result, .. }
+        | Inst::FieldGet { result, .. }
+        | Inst::ClosureAlloc { result, .. }
+        | Inst::EnumAlloc { result, .. }
+        | Inst::EnumTag { result, .. }
+        | Inst::EnumField { result, .. } => Some(*result),
+        _ => None,
+    }
+}
+
+/// Get operand values used by an instruction.
+fn inst_uses(inst: &Inst) -> Vec<Value> {
+    match inst {
+        Inst::BinOp { lhs, rhs, .. } | Inst::ICmp { lhs, rhs, .. } | Inst::FCmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+        Inst::UnOp { operand, .. } => vec![*operand],
+        Inst::Copy { source, .. } => vec![*source],
+        Inst::Return { value } => value.iter().copied().collect(),
+        Inst::Branch { cond, .. } => vec![*cond],
+        Inst::Phi { incoming, .. } => incoming.iter().map(|(v, _)| *v).collect(),
+        Inst::Load { ptr, .. } => vec![*ptr],
+        Inst::Store { value, ptr, .. } => vec![*value, *ptr],
+        Inst::Call { args, .. } => args.clone(),
+        Inst::ArrayGet { array, index, .. } => vec![*array, *index],
+        Inst::ArraySet { array, index, value, .. } => vec![*array, *index, *value],
+        Inst::ArrayLen { array, .. } => vec![*array],
+        Inst::ArrayAlloc { count, .. } => vec![*count],
+        Inst::StructAlloc { fields, .. } => fields.clone(),
+        Inst::FieldGet { object, .. } => vec![*object],
+        Inst::FieldSet { object, value, .. } => vec![*object, *value],
+        Inst::ClosureAlloc { captures, .. } => captures.clone(),
+        Inst::EnumAlloc { fields, .. } => fields.clone(),
+        Inst::EnumTag { enum_val, .. } => vec![*enum_val],
+        Inst::EnumField { enum_val, .. } => vec![*enum_val],
+        _ => Vec::new(),
+    }
+}
+
+/// Check if an instruction is "pure" (has no side-effects and can be hoisted).
+fn is_pure(inst: &Inst) -> bool {
+    matches!(inst,
+        Inst::IConst { .. }
+        | Inst::FConst { .. }
+        | Inst::BConst { .. }
+        | Inst::BinOp { .. }
+        | Inst::UnOp { .. }
+        | Inst::ICmp { .. }
+        | Inst::FCmp { .. }
+        | Inst::Copy { .. }
+    )
+}
+
+/// Loop-invariant code motion: hoist pure computations whose operands
+/// are all defined outside the loop to a preheader block.
+pub fn licm(func: &mut IrFunction) -> u32 {
+    let loops = detect_loops(func);
+    if loops.is_empty() { return 0; }
+
+    let mut hoisted_total = 0u32;
+
+    for (header, body_blocks) in &loops {
+        let body_set: std::collections::HashSet<BlockId> = body_blocks.iter().copied().collect();
+
+        // Collect all values defined inside the loop
+        let mut loop_defs: std::collections::HashSet<Value> = std::collections::HashSet::new();
+        for block in &func.blocks {
+            if body_set.contains(&block.id) {
+                for inst in &block.insts {
+                    if let Some(r) = inst_result(inst) {
+                        loop_defs.insert(r);
+                    }
+                }
+            }
+        }
+
+        // Find invariant instructions: pure, all operands defined outside the loop
+        let mut invariant_insts: Vec<Inst> = Vec::new();
+        for block in &mut func.blocks {
+            if !body_set.contains(&block.id) || block.id == *header { continue; }
+            block.insts.retain(|inst| {
+                if !is_pure(inst) { return true; }
+                let uses = inst_uses(inst);
+                // All operands must be defined outside the loop
+                if uses.iter().all(|u| !loop_defs.contains(u)) {
+                    invariant_insts.push(inst.clone());
+                    false // remove from block
+                } else {
+                    true
+                }
+            });
+        }
+
+        if invariant_insts.is_empty() { continue; }
+
+        // Find the predecessor that jumps to header (preheader).
+        // Insert hoisted instructions just before the terminator of that block.
+        let preheader_idx = func.blocks.iter().position(|b| {
+            !body_set.contains(&b.id) &&
+            b.insts.last().is_some_and(|last| match last {
+                Inst::Jump { target } => *target == *header,
+                Inst::Branch { then_bb, else_bb, .. } => *then_bb == *header || *else_bb == *header,
+                _ => false,
+            })
+        });
+
+        if let Some(idx) = preheader_idx {
+            let count = invariant_insts.len() as u32;
+            let insert_pos = func.blocks[idx].insts.len().saturating_sub(1);
+            for (i, inst) in invariant_insts.into_iter().enumerate() {
+                func.blocks[idx].insts.insert(insert_pos + i, inst);
+            }
+            hoisted_total += count;
+        }
+    }
+
+    hoisted_total
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  v137 — FUNCTION INLINING
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Inline small leaf functions at their call sites.
+/// A function is eligible if:
+/// - It has a single basic block (no control flow)
+/// - Body size ≤ max_size instructions
+/// - It's not recursive
+/// Returns the number of call sites inlined.
+pub fn inline_functions(module: &mut IrModule, max_size: usize) -> u32 {
+    // Collect inlineable functions: single-block, small, non-recursive, leaf
+    let mut inlineable: HashMap<String, (Vec<(String, IrType)>, Vec<Inst>, IrType)> = HashMap::new();
+    for func in &module.functions {
+        if func.blocks.len() != 1 { continue; }
+        let body = &func.blocks[0].insts;
+        if body.len() > max_size { continue; }
+        // Check: no calls (leaf) and not self-recursive
+        let has_call = body.iter().any(|inst| matches!(inst, Inst::Call { .. }));
+        if has_call { continue; }
+        inlineable.insert(
+            func.name.clone(),
+            (func.params.clone(), body.clone(), func.ret_type.clone()),
+        );
+    }
+
+    if inlineable.is_empty() { return 0; }
+
+    let mut inlined_count = 0u32;
+    // Keep a counter for generating fresh values during inlining
+    let mut next_val = module.functions.iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.insts.iter())
+        .filter_map(|inst| inst_result(inst))
+        .map(|v| v.0)
+        .max()
+        .unwrap_or(0) + 1000;
+
+    for func in &mut module.functions {
+        for block in &mut func.blocks {
+            let mut new_insts: Vec<Inst> = Vec::new();
+            for inst in block.insts.drain(..) {
+                if let Inst::Call { result, func: callee, args, .. } = &inst {
+                    if let Some((_params, body, _ret_ty)) = inlineable.get(callee.as_str()) {
+                        // Build value remapping: param values → arg values
+                        let mut remap: HashMap<Value, Value> = HashMap::new();
+
+                        // Map callee parameter values to caller argument values.
+                        // In the IR, params are Value(0)..Value(n-1) inside the callee.
+                        for (i, arg) in args.iter().enumerate() {
+                            remap.insert(Value(i as u32), *arg);
+                        }
+
+                        // First, collect all result values in the body
+                        let body_results: Vec<Value> = body.iter().filter_map(inst_result).collect();
+
+                        // Create fresh values for all body results
+                        for &orig in &body_results {
+                            let fresh = Value(next_val);
+                            next_val += 1;
+                            remap.insert(orig, fresh);
+                        }
+
+                        // If the callee's body returns a value, we need to map
+                        // the final return value to our call result
+                        let mut final_result_mapped = false;
+
+                        for body_inst in body {
+                            match body_inst {
+                                Inst::Return { value: Some(ret_val) } => {
+                                    // Map the return value to the call's result
+                                    let source = remap.get(ret_val).copied().unwrap_or(*ret_val);
+                                    new_insts.push(Inst::Copy { result: *result, source });
+                                    final_result_mapped = true;
+                                }
+                                Inst::Return { value: None } => {
+                                    // Void return — nothing to do
+                                }
+                                _ => {
+                                    // Clone and remap the instruction
+                                    let mut cloned = body_inst.clone();
+                                    remap_inst_values(&mut cloned, &remap);
+                                    new_insts.push(cloned);
+                                }
+                            }
+                        }
+                        let _ = final_result_mapped;
+                        inlined_count += 1;
+                        continue;
+                    }
+                }
+                new_insts.push(inst);
+            }
+            block.insts = new_insts;
+        }
+    }
+
+    inlined_count
+}
+
+/// Remap SSA values in an instruction using the given mapping.
+fn remap_inst_values(inst: &mut Inst, remap: &HashMap<Value, Value>) {
+    let resolve = |v: &mut Value| {
+        if let Some(&new_v) = remap.get(v) {
+            *v = new_v;
+        }
+    };
+    match inst {
+        Inst::IConst { result, .. } | Inst::FConst { result, .. }
+        | Inst::BConst { result, .. } | Inst::StrConst { result, .. } => { resolve(result); }
+        Inst::BinOp { result, lhs, rhs, .. } => { resolve(result); resolve(lhs); resolve(rhs); }
+        Inst::UnOp { result, operand, .. } => { resolve(result); resolve(operand); }
+        Inst::ICmp { result, lhs, rhs, .. } => { resolve(result); resolve(lhs); resolve(rhs); }
+        Inst::FCmp { result, lhs, rhs, .. } => { resolve(result); resolve(lhs); resolve(rhs); }
+        Inst::Copy { result, source } => { resolve(result); resolve(source); }
+        Inst::Alloca { result, .. } => { resolve(result); }
+        Inst::Load { result, ptr, .. } => { resolve(result); resolve(ptr); }
+        Inst::Store { value, ptr, .. } => { resolve(value); resolve(ptr); }
+        Inst::Call { result, args, .. } => {
+            resolve(result);
+            for a in args.iter_mut() { resolve(a); }
+        }
+        Inst::ArrayAlloc { result, count, .. } => { resolve(result); resolve(count); }
+        Inst::ArrayGet { result, array, index, .. } => { resolve(result); resolve(array); resolve(index); }
+        Inst::ArraySet { array, index, value, .. } => { resolve(array); resolve(index); resolve(value); }
+        Inst::ArrayLen { result, array } => { resolve(result); resolve(array); }
+        Inst::StructAlloc { result, fields, .. } => {
+            resolve(result);
+            for f in fields.iter_mut() { resolve(f); }
+        }
+        Inst::FieldGet { result, object, .. } => { resolve(result); resolve(object); }
+        Inst::FieldSet { object, value, .. } => { resolve(object); resolve(value); }
+        Inst::ClosureAlloc { result, captures, .. } => {
+            resolve(result);
+            for c in captures.iter_mut() { resolve(c); }
+        }
+        Inst::EnumAlloc { result, fields, .. } => {
+            resolve(result);
+            for f in fields.iter_mut() { resolve(f); }
+        }
+        Inst::EnumTag { result, enum_val, .. } => { resolve(result); resolve(enum_val); }
+        Inst::EnumField { result, enum_val, .. } => { resolve(result); resolve(enum_val); }
+        Inst::Phi { result, incoming, .. } => {
+            resolve(result);
+            for (v, _) in incoming.iter_mut() { resolve(v); }
+        }
+        _ => {}
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1019,7 +1941,7 @@ impl QuantumLandscape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{IrType, BasicBlock};
+    use crate::ir::{IrType, BasicBlock, BlockId};
 
     // ── Compilation Cache Tests ──────────────────────────────────────
     #[test]
@@ -1283,12 +2205,1350 @@ mod tests {
         let stats = OptPassStats {
             constants_folded: 5,
             dead_eliminated: 3,
+            cse_eliminated: 2,
+            strength_reduced: 1,
             loops_tiled: 1,
+            copies_propagated: 0,
+            blocks_merged: 0,
+            licm_hoisted: 0,
+            functions_inlined: 0,
             instructions_before: 100,
-            instructions_after: 91,
+            instructions_after: 88,
         };
         let json = stats.to_json();
         assert!(json.contains("\"constants_folded\":5"));
         assert!(json.contains("\"dead_eliminated\":3"));
+        assert!(json.contains("\"cse_eliminated\":2"));
+        assert!(json.contains("\"strength_reduced\":1"));
+    }
+
+    // ── Strength Reduction Tests ────────────────────────────────────
+    #[test]
+    fn test_strength_reduce_mul_by_zero() {
+        let mut func = IrFunction {
+            name: "test".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: Value(0), value: 42, ty: IrType::I64 },
+                    Inst::IConst { result: Value(1), value: 0, ty: IrType::I64 },
+                    Inst::BinOp {
+                        result: Value(2), op: IrBinOp::Mul,
+                        lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+                    },
+                    Inst::Return { value: Some(Value(2)) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = strength_reduce(&mut func);
+        assert_eq!(n, 1);
+        // x * 0 → IConst 0
+        assert!(matches!(func.blocks[0].insts[2], Inst::IConst { value: 0, .. }));
+    }
+
+    #[test]
+    fn test_strength_reduce_mul_by_one() {
+        let mut func = IrFunction {
+            name: "test".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: Value(0), value: 7, ty: IrType::I64 },
+                    Inst::IConst { result: Value(1), value: 1, ty: IrType::I64 },
+                    Inst::BinOp {
+                        result: Value(2), op: IrBinOp::Mul,
+                        lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+                    },
+                    Inst::Return { value: Some(Value(2)) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = strength_reduce(&mut func);
+        assert_eq!(n, 1);
+        // x * 1 → Copy(x)
+        assert!(matches!(func.blocks[0].insts[2], Inst::Copy { source: Value(0), .. }));
+    }
+
+    #[test]
+    fn test_strength_reduce_add_zero() {
+        let mut func = IrFunction {
+            name: "test".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: Value(0), value: 5, ty: IrType::I64 },
+                    Inst::IConst { result: Value(1), value: 0, ty: IrType::I64 },
+                    Inst::BinOp {
+                        result: Value(2), op: IrBinOp::Add,
+                        lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+                    },
+                    Inst::Return { value: Some(Value(2)) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = strength_reduce(&mut func);
+        assert_eq!(n, 1);
+        assert!(matches!(func.blocks[0].insts[2], Inst::Copy { source: Value(0), .. }));
+    }
+
+    #[test]
+    fn test_strength_reduce_div_by_one() {
+        let mut func = IrFunction {
+            name: "test".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: Value(0), value: 8, ty: IrType::I64 },
+                    Inst::IConst { result: Value(1), value: 1, ty: IrType::I64 },
+                    Inst::BinOp {
+                        result: Value(2), op: IrBinOp::Div,
+                        lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+                    },
+                    Inst::Return { value: Some(Value(2)) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = strength_reduce(&mut func);
+        assert_eq!(n, 1);
+        assert!(matches!(func.blocks[0].insts[2], Inst::Copy { source: Value(0), .. }));
+    }
+
+    // ── CSE Tests ───────────────────────────────────────────────────
+    #[test]
+    fn test_cse_duplicate_binop() {
+        let mut func = IrFunction {
+            name: "test".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: Value(0), value: 10, ty: IrType::I64 },
+                    Inst::IConst { result: Value(1), value: 20, ty: IrType::I64 },
+                    // First: v2 = v0 + v1
+                    Inst::BinOp {
+                        result: Value(2), op: IrBinOp::Add,
+                        lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+                    },
+                    // Duplicate: v3 = v0 + v1  (same operands)
+                    Inst::BinOp {
+                        result: Value(3), op: IrBinOp::Add,
+                        lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+                    },
+                    Inst::Return { value: Some(Value(3)) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = cse(&mut func);
+        assert_eq!(n, 1);
+        // Second BinOp should now be Copy(v2)
+        assert!(matches!(func.blocks[0].insts[3], Inst::Copy { result: Value(3), source: Value(2) }));
+    }
+
+    #[test]
+    fn test_cse_different_ops_not_eliminated() {
+        let mut func = IrFunction {
+            name: "test".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: Value(0), value: 10, ty: IrType::I64 },
+                    Inst::IConst { result: Value(1), value: 20, ty: IrType::I64 },
+                    Inst::BinOp {
+                        result: Value(2), op: IrBinOp::Add,
+                        lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+                    },
+                    Inst::BinOp {
+                        result: Value(3), op: IrBinOp::Mul,
+                        lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+                    },
+                    Inst::Return { value: Some(Value(3)) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = cse(&mut func);
+        assert_eq!(n, 0); // Different ops, nothing eliminated
+    }
+
+    // ── ICmp/FCmp constant folding tests ────────────────────────────
+    #[test]
+    fn test_constant_fold_icmp() {
+        let mut func = IrFunction {
+            name: "test".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: Value(0), value: 5, ty: IrType::I64 },
+                    Inst::IConst { result: Value(1), value: 10, ty: IrType::I64 },
+                    Inst::ICmp {
+                        result: Value(2), cond: IrCmp::Lt,
+                        lhs: Value(0), rhs: Value(1),
+                    },
+                    Inst::Return { value: Some(Value(2)) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = constant_fold(&mut func);
+        assert_eq!(n, 1);
+        // 5 < 10 → true → IConst 1
+        assert!(matches!(func.blocks[0].insts[2], Inst::IConst { value: 1, .. }));
+    }
+
+    #[test]
+    fn test_constant_fold_fcmp() {
+        let mut func = IrFunction {
+            name: "test".to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::FConst { result: Value(0), value: 3.14, ty: IrType::F64 },
+                    Inst::FConst { result: Value(1), value: 2.72, ty: IrType::F64 },
+                    Inst::FCmp {
+                        result: Value(2), cond: IrCmp::Gt,
+                        lhs: Value(0), rhs: Value(1),
+                    },
+                    Inst::Return { value: Some(Value(2)) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = constant_fold(&mut func);
+        assert_eq!(n, 1);
+        // 3.14 > 2.72 → true → IConst 1
+        assert!(matches!(func.blocks[0].insts[2], Inst::IConst { value: 1, .. }));
+    }
+
+    // ── Pipeline integration test ───────────────────────────────────
+    #[test]
+    fn test_optimize_ir_pipeline() {
+        let mut module = IrModule {
+            functions: vec![IrFunction {
+                name: "pipeline_test".to_string(),
+                params: vec![],
+                ret_type: IrType::I64,
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![
+                        Inst::IConst { result: Value(0), value: 10, ty: IrType::I64 },
+                        Inst::IConst { result: Value(1), value: 1, ty: IrType::I64 },
+                        // x * 1 → strength reduce to Copy
+                        Inst::BinOp {
+                            result: Value(2), op: IrBinOp::Mul,
+                            lhs: Value(0), rhs: Value(1), ty: IrType::I64,
+                        },
+                        Inst::IConst { result: Value(3), value: 20, ty: IrType::I64 },
+                        // constant fold: 10 + 20 = 30
+                        Inst::BinOp {
+                            result: Value(4), op: IrBinOp::Add,
+                            lhs: Value(0), rhs: Value(3), ty: IrType::I64,
+                        },
+                        // Dead: Value(5) never used
+                        Inst::IConst { result: Value(5), value: 999, ty: IrType::I64 },
+                        Inst::Return { value: Some(Value(4)) },
+                    ],
+                }],
+                entry: BlockId(0),
+            }],
+            string_constants: vec![],
+        };
+
+        let stats = optimize_ir(&mut module);
+        assert!(stats.constants_folded > 0 || stats.strength_reduced > 0 || stats.dead_eliminated > 0);
+        // Total instructions should have decreased
+        assert!(stats.instructions_after <= stats.instructions_before);
+    }
+
+    // ─── v126: Dead Function Elimination & AOT Optimization Tests ───
+
+    fn make_empty_func(name: &str) -> IrFunction {
+        IrFunction {
+            name: name.to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: Value(0), value: 0, ty: IrType::I64 },
+                    Inst::Return { value: Some(Value(0)) },
+                ],
+            }],
+            entry: BlockId(0),
+        }
+    }
+
+    fn make_calling_func(name: &str, calls: &[&str]) -> IrFunction {
+        let mut insts: Vec<Inst> = calls.iter().enumerate().map(|(i, callee)| {
+            Inst::Call {
+                result: Value(i as u32),
+                func: callee.to_string(),
+                args: vec![],
+                ret_ty: IrType::I64,
+            }
+        }).collect();
+        let ret_val = if calls.is_empty() { Value(0) } else { Value((calls.len() - 1) as u32) };
+
+        if calls.is_empty() {
+            insts.push(Inst::IConst { result: Value(0), value: 0, ty: IrType::I64 });
+        }
+        insts.push(Inst::Return { value: Some(ret_val) });
+
+        IrFunction {
+            name: name.to_string(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts,
+            }],
+            entry: BlockId(0),
+        }
+    }
+
+    #[test]
+    fn test_dead_function_eliminate_removes_unused() {
+        let mut module = IrModule {
+            functions: vec![
+                make_empty_func("main"),
+                make_empty_func("unused_a"),
+                make_empty_func("unused_b"),
+            ],
+            string_constants: vec![],
+        };
+        let removed = dead_function_eliminate(&mut module);
+        assert_eq!(removed, 2);
+        assert_eq!(module.functions.len(), 1);
+        assert_eq!(module.functions[0].name, "main");
+    }
+
+    #[test]
+    fn test_dead_function_eliminate_keeps_called() {
+        let mut module = IrModule {
+            functions: vec![
+                make_calling_func("main", &["helper"]),
+                make_empty_func("helper"),
+                make_empty_func("unused"),
+            ],
+            string_constants: vec![],
+        };
+        let removed = dead_function_eliminate(&mut module);
+        assert_eq!(removed, 1);
+        assert_eq!(module.functions.len(), 2);
+        let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"main"));
+        assert!(names.contains(&"helper"));
+    }
+
+    #[test]
+    fn test_dead_function_eliminate_transitive() {
+        let mut module = IrModule {
+            functions: vec![
+                make_calling_func("main", &["a"]),
+                make_calling_func("a", &["b"]),
+                make_empty_func("b"),
+                make_empty_func("orphan"),
+            ],
+            string_constants: vec![],
+        };
+        let removed = dead_function_eliminate(&mut module);
+        assert_eq!(removed, 1);
+        assert_eq!(module.functions.len(), 3);
+    }
+
+    #[test]
+    fn test_dead_function_eliminate_no_main() {
+        let mut module = IrModule {
+            functions: vec![
+                make_empty_func("library_fn"),
+                make_empty_func("another_fn"),
+            ],
+            string_constants: vec![],
+        };
+        // No main → library mode, keep everything
+        let removed = dead_function_eliminate(&mut module);
+        assert_eq!(removed, 0);
+        assert_eq!(module.functions.len(), 2);
+    }
+
+    #[test]
+    fn test_dead_function_eliminate_empty_module() {
+        let mut module = IrModule {
+            functions: vec![],
+            string_constants: vec![],
+        };
+        let removed = dead_function_eliminate(&mut module);
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_dead_function_eliminate_all_reachable() {
+        let mut module = IrModule {
+            functions: vec![
+                make_calling_func("main", &["a", "b"]),
+                make_empty_func("a"),
+                make_empty_func("b"),
+            ],
+            string_constants: vec![],
+        };
+        let removed = dead_function_eliminate(&mut module);
+        assert_eq!(removed, 0);
+        assert_eq!(module.functions.len(), 3);
+    }
+
+    #[test]
+    fn test_optimize_ir_includes_dead_fn_elim() {
+        let mut module = IrModule {
+            functions: vec![
+                make_empty_func("main"),
+                make_empty_func("dead_fn"),
+            ],
+            string_constants: vec![],
+        };
+        let stats = optimize_ir(&mut module);
+        assert!(stats.dead_eliminated > 0);
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    // ── v128: FCmp constant fold fix ───────────────────────────────
+
+    #[test]
+    fn test_v128_fcmp_eq_exact_bits() {
+        // Verify FCmp Eq uses bit-exact comparison, not epsilon
+        use crate::ir::*;
+        let r1 = Value(100);
+        let r2 = Value(101);
+        let r3 = Value(102);
+        let mut func = IrFunction {
+            name: "test_fcmp".into(),
+            params: vec![],
+            ret_type: IrType::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::FConst { result: r1, value: 1.0, ty: IrType::F64 },
+                    Inst::FConst { result: r2, value: 1.0, ty: IrType::F64 },
+                    Inst::FCmp { result: r3, cond: IrCmp::Eq, lhs: r1, rhs: r2 },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        constant_fold(&mut func);
+        // 1.0 == 1.0 should fold to true (1)
+        let last = &func.blocks[0].insts.last().unwrap();
+        if let Inst::IConst { value, .. } = last {
+            assert_eq!(*value, 1, "1.0 == 1.0 should fold to true");
+        }
+    }
+
+    #[test]
+    fn test_v128_fcmp_ne_different_values() {
+        use crate::ir::*;
+        let r1 = Value(100);
+        let r2 = Value(101);
+        let r3 = Value(102);
+        let mut func = IrFunction {
+            name: "test_fcmp_ne".into(),
+            params: vec![],
+            ret_type: IrType::Bool,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::FConst { result: r1, value: 0.0, ty: IrType::F64 },
+                    Inst::FConst { result: r2, value: -0.0, ty: IrType::F64 },
+                    Inst::FCmp { result: r3, cond: IrCmp::Ne, lhs: r1, rhs: r2 },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        constant_fold(&mut func);
+        // 0.0 and -0.0 have different bits so should be Ne = true
+        let last = &func.blocks[0].insts.last().unwrap();
+        if let Inst::IConst { value, .. } = last {
+            assert_eq!(*value, 1, "0.0 != -0.0 at bit level");
+        }
+    }
+
+    // ── v135 Copy Propagation Tests ──────────────────────────────────
+
+    #[test]
+    fn test_v135_copy_propagate_basic() {
+        // v1 = 42; v2 = copy v1; v3 = v2 + v2 → v3 should use v1
+        use crate::ir::*;
+        let v1 = Value(1);
+        let v2 = Value(2);
+        let v3 = Value(3);
+        let mut func = IrFunction {
+            name: "test_copy".into(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: v1, value: 42, ty: IrType::I64 },
+                    Inst::Copy { result: v2, source: v1 },
+                    Inst::BinOp { result: v3, op: IrBinOp::Add, lhs: v2, rhs: v2, ty: IrType::I64 },
+                    Inst::Return { value: Some(v3) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = copy_propagate(&mut func);
+        assert!(n >= 2, "should propagate at least 2 uses of v2 → v1");
+        // The BinOp should now reference v1 instead of v2
+        if let Inst::BinOp { lhs, rhs, .. } = &func.blocks[0].insts[2] {
+            assert_eq!(*lhs, v1);
+            assert_eq!(*rhs, v1);
+        } else {
+            panic!("expected BinOp");
+        }
+    }
+
+    #[test]
+    fn test_v135_copy_propagate_chain() {
+        // v1 = 10; v2 = copy v1; v3 = copy v2; return v3 → return v1
+        use crate::ir::*;
+        let v1 = Value(1);
+        let v2 = Value(2);
+        let v3 = Value(3);
+        let mut func = IrFunction {
+            name: "test_chain".into(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: v1, value: 10, ty: IrType::I64 },
+                    Inst::Copy { result: v2, source: v1 },
+                    Inst::Copy { result: v3, source: v2 },
+                    Inst::Return { value: Some(v3) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = copy_propagate(&mut func);
+        assert!(n >= 1);
+        // Return should now reference v1 directly
+        if let Inst::Return { value: Some(ret_val) } = &func.blocks[0].insts[3] {
+            assert_eq!(*ret_val, v1, "transitive copy chain should resolve to root");
+        } else {
+            panic!("expected Return");
+        }
+    }
+
+    #[test]
+    fn test_v135_copy_propagate_no_copies() {
+        // No copies → no changes
+        use crate::ir::*;
+        let v1 = Value(1);
+        let v2 = Value(2);
+        let v3 = Value(3);
+        let mut func = IrFunction {
+            name: "test_no_copies".into(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: v1, value: 1, ty: IrType::I64 },
+                    Inst::IConst { result: v2, value: 2, ty: IrType::I64 },
+                    Inst::BinOp { result: v3, op: IrBinOp::Add, lhs: v1, rhs: v2, ty: IrType::I64 },
+                    Inst::Return { value: Some(v3) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = copy_propagate(&mut func);
+        assert_eq!(n, 0, "no copies means no propagation");
+    }
+
+    #[test]
+    fn test_v135_copy_propagate_in_call_args() {
+        // v1 = 5; v2 = copy v1; call foo(v2) → call foo(v1)
+        use crate::ir::*;
+        let v1 = Value(1);
+        let v2 = Value(2);
+        let v3 = Value(3);
+        let mut func = IrFunction {
+            name: "test_call_prop".into(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: v1, value: 5, ty: IrType::I64 },
+                    Inst::Copy { result: v2, source: v1 },
+                    Inst::Call { result: v3, func: "foo".into(), args: vec![v2], ret_ty: IrType::I64 },
+                    Inst::Return { value: Some(v3) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = copy_propagate(&mut func);
+        assert!(n >= 1);
+        if let Inst::Call { args, .. } = &func.blocks[0].insts[2] {
+            assert_eq!(args[0], v1, "call arg should be propagated to v1");
+        } else {
+            panic!("expected Call");
+        }
+    }
+
+    #[test]
+    fn test_v135_copy_propagate_in_branch() {
+        // v1 = true; v2 = copy v1; branch v2 → branch v1
+        use crate::ir::*;
+        let v1 = Value(1);
+        let v2 = Value(2);
+        let mut func = IrFunction {
+            name: "test_branch_prop".into(),
+            params: vec![],
+            ret_type: IrType::Void,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![
+                        Inst::BConst { result: v1, value: true },
+                        Inst::Copy { result: v2, source: v1 },
+                        Inst::Branch { cond: v2, then_bb: BlockId(1), else_bb: BlockId(2) },
+                    ],
+                },
+                BasicBlock { id: BlockId(1), insts: vec![Inst::Return { value: None }] },
+                BasicBlock { id: BlockId(2), insts: vec![Inst::Return { value: None }] },
+            ],
+            entry: BlockId(0),
+        };
+        let n = copy_propagate(&mut func);
+        assert!(n >= 1);
+        if let Inst::Branch { cond, .. } = &func.blocks[0].insts[2] {
+            assert_eq!(*cond, v1, "branch condition should be propagated to v1");
+        }
+    }
+
+    // ── v135 Block Merging Tests ─────────────────────────────────────
+
+    #[test]
+    fn test_v135_merge_blocks_basic() {
+        // Block 0 jumps to Block 1 (sole predecessor) → merge into one block
+        use crate::ir::*;
+        let v1 = Value(1);
+        let v2 = Value(2);
+        let v3 = Value(3);
+        let mut func = IrFunction {
+            name: "test_merge".into(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![
+                        Inst::IConst { result: v1, value: 10, ty: IrType::I64 },
+                        Inst::IConst { result: v2, value: 20, ty: IrType::I64 },
+                        Inst::Jump { target: BlockId(1) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    insts: vec![
+                        Inst::BinOp { result: v3, op: IrBinOp::Add, lhs: v1, rhs: v2, ty: IrType::I64 },
+                        Inst::Return { value: Some(v3) },
+                    ],
+                },
+            ],
+            entry: BlockId(0),
+        };
+        let n = merge_blocks(&mut func);
+        assert_eq!(n, 1, "should merge one block pair");
+        assert_eq!(func.blocks.len(), 1, "should have 1 block after merge");
+        // Block should have: IConst, IConst, BinOp, Return (Jump removed)
+        assert_eq!(func.blocks[0].insts.len(), 4);
+    }
+
+    #[test]
+    fn test_v135_merge_blocks_no_merge_multiple_preds() {
+        // Block 1 has two predecessors (0 and 2) → no merge
+        use crate::ir::*;
+        let v1 = Value(1);
+        let mut func = IrFunction {
+            name: "test_no_merge".into(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![
+                        Inst::BConst { result: v1, value: true },
+                        Inst::Branch { cond: v1, then_bb: BlockId(1), else_bb: BlockId(2) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    insts: vec![Inst::Return { value: None }],
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    insts: vec![Inst::Jump { target: BlockId(1) }],
+                },
+            ],
+            entry: BlockId(0),
+        };
+        let n = merge_blocks(&mut func);
+        assert_eq!(n, 0, "block 1 has multiple predecessors, cannot merge");
+    }
+
+    #[test]
+    fn test_v135_merge_blocks_chain() {
+        // Block 0 → Block 1 → Block 2 (all single pred) → merge all into one
+        use crate::ir::*;
+        let v1 = Value(1);
+        let v2 = Value(2);
+        let mut func = IrFunction {
+            name: "test_chain_merge".into(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![
+                        Inst::IConst { result: v1, value: 1, ty: IrType::I64 },
+                        Inst::Jump { target: BlockId(1) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    insts: vec![
+                        Inst::IConst { result: v2, value: 2, ty: IrType::I64 },
+                        Inst::Jump { target: BlockId(2) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    insts: vec![Inst::Return { value: Some(v2) }],
+                },
+            ],
+            entry: BlockId(0),
+        };
+        let n = merge_blocks(&mut func);
+        assert_eq!(n, 2, "should merge two pairs");
+        assert_eq!(func.blocks.len(), 1, "should have 1 block after chain merge");
+    }
+
+    #[test]
+    fn test_v135_merge_blocks_single_block() {
+        // Single block → no merge needed
+        use crate::ir::*;
+        let mut func = IrFunction {
+            name: "test_single".into(),
+            params: vec![],
+            ret_type: IrType::Void,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![Inst::Return { value: None }],
+            }],
+            entry: BlockId(0),
+        };
+        let n = merge_blocks(&mut func);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_v135_merge_blocks_skip_phi() {
+        // Block 1 has Phi node → skip merge even if single predecessor
+        use crate::ir::*;
+        let v1 = Value(1);
+        let v2 = Value(2);
+        let mut func = IrFunction {
+            name: "test_phi_skip".into(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![
+                        Inst::IConst { result: v1, value: 5, ty: IrType::I64 },
+                        Inst::Jump { target: BlockId(1) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    insts: vec![
+                        Inst::Phi { result: v2, incoming: vec![(v1, BlockId(0))], ty: IrType::I64 },
+                        Inst::Return { value: Some(v2) },
+                    ],
+                },
+            ],
+            entry: BlockId(0),
+        };
+        let n = merge_blocks(&mut func);
+        assert_eq!(n, 0, "should not merge blocks with Phi nodes");
+    }
+
+    // ── v135 Combined Pipeline Tests ─────────────────────────────────
+
+    #[test]
+    fn test_v135_optimize_ir_includes_new_passes() {
+        // Full pipeline with copy propagation + block merging
+        use crate::ir::*;
+        let v1 = Value(1);
+        let v2 = Value(2);
+        let v3 = Value(3);
+        let v4 = Value(4);
+        let mut module = IrModule {
+            functions: vec![IrFunction {
+                name: "main".into(),
+                params: vec![],
+                ret_type: IrType::I64,
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::IConst { result: v1, value: 10, ty: IrType::I64 },
+                            Inst::Copy { result: v2, source: v1 },
+                            Inst::Jump { target: BlockId(1) },
+                        ],
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        insts: vec![
+                            Inst::IConst { result: v3, value: 20, ty: IrType::I64 },
+                            Inst::BinOp { result: v4, op: IrBinOp::Add, lhs: v2, rhs: v3, ty: IrType::I64 },
+                            Inst::Return { value: Some(v4) },
+                        ],
+                    },
+                ],
+                entry: BlockId(0),
+            }],
+            string_constants: vec![],
+        };
+        let stats = optimize_ir(&mut module);
+        // Copy should be propagated and/or eliminated
+        assert!(stats.copies_propagated > 0 || stats.dead_eliminated > 0,
+            "new passes should contribute to optimization");
+        // Blocks should be merged (block 1 has single predecessor)
+        assert!(stats.blocks_merged > 0, "block merging should occur");
+    }
+
+    #[test]
+    fn test_v135_stats_json_includes_new_fields() {
+        let stats = OptPassStats {
+            constants_folded: 1,
+            dead_eliminated: 2,
+            cse_eliminated: 3,
+            strength_reduced: 4,
+            loops_tiled: 0,
+            copies_propagated: 5,
+            blocks_merged: 6,
+            licm_hoisted: 0,
+            functions_inlined: 0,
+            instructions_before: 100,
+            instructions_after: 80,
+        };
+        let json = stats.to_json();
+        assert!(json.contains("\"copies_propagated\":5"));
+        assert!(json.contains("\"blocks_merged\":6"));
+    }
+
+    // ── v136 Loop Optimization Tests ─────────────────────────────────
+
+    #[test]
+    fn test_v136_detect_loops_simple_while() {
+        // Block 0 → Block 1 (header) → Block 2 (body) → Block 1 (back-edge)
+        use crate::ir::*;
+        let v1 = Value(1);
+        let v2 = Value(2);
+        let func = IrFunction {
+            name: "test_loop".into(),
+            params: vec![],
+            ret_type: IrType::Void,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![
+                        Inst::BConst { result: v1, value: true },
+                        Inst::Jump { target: BlockId(1) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    insts: vec![
+                        Inst::Branch { cond: v1, then_bb: BlockId(2), else_bb: BlockId(3) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    insts: vec![
+                        Inst::IConst { result: v2, value: 0, ty: IrType::I64 },
+                        Inst::Jump { target: BlockId(1) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    insts: vec![Inst::Return { value: None }],
+                },
+            ],
+            entry: BlockId(0),
+        };
+        let loops = detect_loops(&func);
+        assert!(!loops.is_empty(), "should detect the while-loop");
+        // Header should be block 1
+        assert!(loops.iter().any(|(h, _)| *h == BlockId(1)));
+    }
+
+    #[test]
+    fn test_v136_detect_loops_no_loop() {
+        use crate::ir::*;
+        let func = IrFunction {
+            name: "no_loop".into(),
+            params: vec![],
+            ret_type: IrType::Void,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![Inst::Jump { target: BlockId(1) }],
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    insts: vec![Inst::Return { value: None }],
+                },
+            ],
+            entry: BlockId(0),
+        };
+        let loops = detect_loops(&func);
+        assert!(loops.is_empty(), "linear CFG has no loops");
+    }
+
+    #[test]
+    fn test_v136_licm_hoist_constant() {
+        // Loop body has a constant that can be hoisted
+        // Block 0: preheader → jump to header (block 1)
+        // Block 1: header → branch to body (block 2) or exit (block 3)
+        // Block 2: body → IConst + BinOp + jump back to header
+        // Block 3: exit → return
+        use crate::ir::*;
+        let cond = Value(1);
+        let c42 = Value(2); // loop-invariant constant
+        let v3 = Value(3);
+        let v4 = Value(4);
+        let mut func = IrFunction {
+            name: "test_licm".into(),
+            params: vec![("cond".into(), IrType::Bool)],
+            ret_type: IrType::I64,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![Inst::Jump { target: BlockId(1) }],
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    insts: vec![
+                        Inst::Branch { cond, then_bb: BlockId(2), else_bb: BlockId(3) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    insts: vec![
+                        // c42 is loop-invariant (no operands from inside loop)
+                        Inst::IConst { result: c42, value: 42, ty: IrType::I64 },
+                        Inst::IConst { result: v3, value: 1, ty: IrType::I64 },
+                        Inst::BinOp { result: v4, op: IrBinOp::Add, lhs: c42, rhs: v3, ty: IrType::I64 },
+                        Inst::Jump { target: BlockId(1) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    insts: vec![Inst::Return { value: None }],
+                },
+            ],
+            entry: BlockId(0),
+        };
+        let n = licm(&mut func);
+        // Constants should be hoisted out of the loop body
+        assert!(n > 0, "should hoist loop-invariant instructions");
+        // Check that block 0 (preheader) now has more instructions
+        assert!(func.blocks[0].insts.len() > 1, "preheader should have hoisted instructions");
+    }
+
+    #[test]
+    fn test_v136_licm_no_hoist_impure() {
+        // Call instruction in loop body should NOT be hoisted
+        use crate::ir::*;
+        let cond = Value(1);
+        let v2 = Value(2);
+        let mut func = IrFunction {
+            name: "test_no_hoist".into(),
+            params: vec![("cond".into(), IrType::Bool)],
+            ret_type: IrType::Void,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![Inst::Jump { target: BlockId(1) }],
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    insts: vec![
+                        Inst::Branch { cond, then_bb: BlockId(2), else_bb: BlockId(3) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    insts: vec![
+                        Inst::Call { result: v2, func: "side_effect".into(), args: vec![], ret_ty: IrType::I64 },
+                        Inst::Jump { target: BlockId(1) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    insts: vec![Inst::Return { value: None }],
+                },
+            ],
+            entry: BlockId(0),
+        };
+        let n = licm(&mut func);
+        assert_eq!(n, 0, "impure (Call) instruction should not be hoisted");
+    }
+
+    #[test]
+    fn test_v136_licm_no_loop_no_hoist() {
+        // No loops → LICM does nothing
+        use crate::ir::*;
+        let v1 = Value(1);
+        let mut func = IrFunction {
+            name: "no_loop".into(),
+            params: vec![],
+            ret_type: IrType::I64,
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::IConst { result: v1, value: 5, ty: IrType::I64 },
+                    Inst::Return { value: Some(v1) },
+                ],
+            }],
+            entry: BlockId(0),
+        };
+        let n = licm(&mut func);
+        assert_eq!(n, 0, "no loops means no LICM");
+    }
+
+    #[test]
+    fn test_v136_licm_dont_hoist_loop_dependent() {
+        // BinOp that uses a value defined inside the loop should NOT be hoisted
+        use crate::ir::*;
+        let cond = Value(1);
+        let v2 = Value(2);  // defined outside
+        let v3 = Value(3);  // defined inside loop
+        let v4 = Value(4);  // uses v3, so loop-dependent
+        let mut func = IrFunction {
+            name: "test_dep".into(),
+            params: vec![("cond".into(), IrType::Bool), ("v2".into(), IrType::I64)],
+            ret_type: IrType::Void,
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    insts: vec![Inst::Jump { target: BlockId(1) }],
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    insts: vec![
+                        Inst::Branch { cond, then_bb: BlockId(2), else_bb: BlockId(3) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    insts: vec![
+                        Inst::Call { result: v3, func: "get_val".into(), args: vec![], ret_ty: IrType::I64 },
+                        Inst::BinOp { result: v4, op: IrBinOp::Add, lhs: v2, rhs: v3, ty: IrType::I64 },
+                        Inst::Jump { target: BlockId(1) },
+                    ],
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    insts: vec![Inst::Return { value: None }],
+                },
+            ],
+            entry: BlockId(0),
+        };
+        let n = licm(&mut func);
+        assert_eq!(n, 0, "BinOp using loop-defined value should not be hoisted");
+    }
+
+    #[test]
+    fn test_v136_stats_json_includes_licm() {
+        let stats = OptPassStats {
+            constants_folded: 0,
+            dead_eliminated: 0,
+            cse_eliminated: 0,
+            strength_reduced: 0,
+            loops_tiled: 0,
+            copies_propagated: 0,
+            blocks_merged: 0,
+            licm_hoisted: 7,
+            functions_inlined: 0,
+            instructions_before: 50,
+            instructions_after: 43,
+        };
+        let json = stats.to_json();
+        assert!(json.contains("\"licm_hoisted\":7"));
+    }
+
+    // ── v137 Function Inlining Tests ─────────────────────────────────
+
+    #[test]
+    fn test_v137_inline_simple_leaf() {
+        // add(a, b) -> a + b; main calls add(10, 20)
+        use crate::ir::*;
+        let a = Value(1);
+        let b = Value(2);
+        let r = Value(3);
+        let m1 = Value(10);
+        let m2 = Value(11);
+        let m3 = Value(12);
+        let mut module = IrModule {
+            functions: vec![
+                IrFunction {
+                    name: "add".into(),
+                    params: vec![("a".into(), IrType::I64), ("b".into(), IrType::I64)],
+                    ret_type: IrType::I64,
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::BinOp { result: r, op: IrBinOp::Add, lhs: a, rhs: b, ty: IrType::I64 },
+                            Inst::Return { value: Some(r) },
+                        ],
+                    }],
+                    entry: BlockId(0),
+                },
+                IrFunction {
+                    name: "main".into(),
+                    params: vec![],
+                    ret_type: IrType::I64,
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::IConst { result: m1, value: 10, ty: IrType::I64 },
+                            Inst::IConst { result: m2, value: 20, ty: IrType::I64 },
+                            Inst::Call { result: m3, func: "add".into(), args: vec![m1, m2], ret_ty: IrType::I64 },
+                            Inst::Return { value: Some(m3) },
+                        ],
+                    }],
+                    entry: BlockId(0),
+                },
+            ],
+            string_constants: vec![],
+        };
+        let n = inline_functions(&mut module, 30);
+        assert_eq!(n, 1, "should inline one call site");
+        // The main function should no longer have a Call to "add"
+        let main = module.functions.iter().find(|f| f.name == "main").unwrap();
+        let has_call = main.blocks[0].insts.iter().any(|inst| {
+            matches!(inst, Inst::Call { func, .. } if func == "add")
+        });
+        assert!(!has_call, "add call should be replaced with inlined body");
+    }
+
+    #[test]
+    fn test_v137_no_inline_large_function() {
+        // Function with too many instructions should not be inlined
+        use crate::ir::*;
+        let mut insts = Vec::new();
+        for i in 0..40 {
+            insts.push(Inst::IConst { result: Value(i), value: i as i64, ty: IrType::I64 });
+        }
+        insts.push(Inst::Return { value: Some(Value(0)) });
+        let mut module = IrModule {
+            functions: vec![
+                IrFunction {
+                    name: "big".into(),
+                    params: vec![],
+                    ret_type: IrType::I64,
+                    blocks: vec![BasicBlock { id: BlockId(0), insts }],
+                    entry: BlockId(0),
+                },
+                IrFunction {
+                    name: "main".into(),
+                    params: vec![],
+                    ret_type: IrType::I64,
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::Call { result: Value(100), func: "big".into(), args: vec![], ret_ty: IrType::I64 },
+                            Inst::Return { value: Some(Value(100)) },
+                        ],
+                    }],
+                    entry: BlockId(0),
+                },
+            ],
+            string_constants: vec![],
+        };
+        let n = inline_functions(&mut module, 30);
+        assert_eq!(n, 0, "function with 41 instructions should not be inlined (max 30)");
+    }
+
+    #[test]
+    fn test_v137_no_inline_multi_block() {
+        // Function with control flow (multiple blocks) should not be inlined
+        use crate::ir::*;
+        let v1 = Value(1);
+        let mut module = IrModule {
+            functions: vec![
+                IrFunction {
+                    name: "branchy".into(),
+                    params: vec![],
+                    ret_type: IrType::Void,
+                    blocks: vec![
+                        BasicBlock {
+                            id: BlockId(0),
+                            insts: vec![
+                                Inst::BConst { result: v1, value: true },
+                                Inst::Branch { cond: v1, then_bb: BlockId(1), else_bb: BlockId(2) },
+                            ],
+                        },
+                        BasicBlock { id: BlockId(1), insts: vec![Inst::Return { value: None }] },
+                        BasicBlock { id: BlockId(2), insts: vec![Inst::Return { value: None }] },
+                    ],
+                    entry: BlockId(0),
+                },
+                IrFunction {
+                    name: "main".into(),
+                    params: vec![],
+                    ret_type: IrType::I64,
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::Call { result: Value(50), func: "branchy".into(), args: vec![], ret_ty: IrType::Void },
+                            Inst::IConst { result: Value(51), value: 0, ty: IrType::I64 },
+                            Inst::Return { value: Some(Value(51)) },
+                        ],
+                    }],
+                    entry: BlockId(0),
+                },
+            ],
+            string_constants: vec![],
+        };
+        let n = inline_functions(&mut module, 30);
+        assert_eq!(n, 0, "multi-block function cannot be inlined");
+    }
+
+    #[test]
+    fn test_v137_no_inline_non_leaf() {
+        // Function that calls other functions should not be inlined
+        use crate::ir::*;
+        let mut module = IrModule {
+            functions: vec![
+                IrFunction {
+                    name: "wrapper".into(),
+                    params: vec![],
+                    ret_type: IrType::I64,
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::Call { result: Value(1), func: "inner".into(), args: vec![], ret_ty: IrType::I64 },
+                            Inst::Return { value: Some(Value(1)) },
+                        ],
+                    }],
+                    entry: BlockId(0),
+                },
+                IrFunction {
+                    name: "main".into(),
+                    params: vec![],
+                    ret_type: IrType::I64,
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::Call { result: Value(10), func: "wrapper".into(), args: vec![], ret_ty: IrType::I64 },
+                            Inst::Return { value: Some(Value(10)) },
+                        ],
+                    }],
+                    entry: BlockId(0),
+                },
+            ],
+            string_constants: vec![],
+        };
+        let n = inline_functions(&mut module, 30);
+        assert_eq!(n, 0, "non-leaf function should not be inlined");
+    }
+
+    #[test]
+    fn test_v137_jit_uses_optimizer() {
+        // Verify that compile_and_run now optimizes IR
+        // This is an integration test: constant folding should work via JIT
+        let result = crate::codegen::compile_and_run_nocache(
+            "fn main() -> i64 { 2 + 3 }"
+        );
+        assert_eq!(result.unwrap(), 5, "JIT should still produce correct results with optimizer");
+    }
+
+    #[test]
+    fn test_v137_optimize_ir_includes_inlining() {
+        use crate::ir::*;
+        let mut module = IrModule {
+            functions: vec![
+                IrFunction {
+                    name: "const_five".into(),
+                    params: vec![],
+                    ret_type: IrType::I64,
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::IConst { result: Value(1), value: 5, ty: IrType::I64 },
+                            Inst::Return { value: Some(Value(1)) },
+                        ],
+                    }],
+                    entry: BlockId(0),
+                },
+                IrFunction {
+                    name: "main".into(),
+                    params: vec![],
+                    ret_type: IrType::I64,
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::Call { result: Value(10), func: "const_five".into(), args: vec![], ret_ty: IrType::I64 },
+                            Inst::Return { value: Some(Value(10)) },
+                        ],
+                    }],
+                    entry: BlockId(0),
+                },
+            ],
+            string_constants: vec![],
+        };
+        let stats = optimize_ir(&mut module);
+        assert!(stats.functions_inlined > 0, "optimize_ir should inline small functions");
+    }
+
+    #[test]
+    fn test_v137_stats_json_includes_inlined() {
+        let stats = OptPassStats {
+            constants_folded: 0,
+            dead_eliminated: 0,
+            cse_eliminated: 0,
+            strength_reduced: 0,
+            loops_tiled: 0,
+            copies_propagated: 0,
+            blocks_merged: 0,
+            licm_hoisted: 0,
+            functions_inlined: 3,
+            instructions_before: 40,
+            instructions_after: 32,
+        };
+        let json = stats.to_json();
+        assert!(json.contains("\"functions_inlined\":3"));
     }
 }

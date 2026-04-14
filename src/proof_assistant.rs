@@ -253,7 +253,7 @@ fn tactic_apply(goal: &Goal, hyp_name: &str) -> TacticResult {
     }
 }
 
-fn tactic_exact(goal: &Goal, _term: &ProofTerm) -> TacticResult {
+fn tactic_exact(_goal: &Goal, _term: &ProofTerm) -> TacticResult {
     // Simplified: accept any exact proof.
     TacticResult::Proved(_term.clone())
 }

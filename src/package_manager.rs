@@ -19,7 +19,7 @@
 //!     test_main.sl
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -295,6 +295,11 @@ impl Lockfile {
         }
         s
     }
+
+    /// Sort lock entries to make lockfile generation deterministic across runs.
+    pub fn sort_stable(&mut self) {
+        self.entries.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+    }
 }
 
 // ─── Package Registry ───────────────────────────────────────────────────
@@ -308,10 +313,18 @@ pub struct RegistryEntry {
     pub downloads: u64,
 }
 
+/// Immutable artifact metadata stored in the registry index.
+#[derive(Debug, Clone)]
+pub struct ArtifactMetadata {
+    pub checksum: String,
+    pub signature: String,
+}
+
 /// The package registry (local simulation).
 #[derive(Debug, Default)]
 pub struct Registry {
     packages: HashMap<String, RegistryEntry>,
+    artifacts: BTreeMap<(String, SemVer), ArtifactMetadata>,
 }
 
 impl Registry {
@@ -338,6 +351,44 @@ impl Registry {
         true
     }
 
+    /// Publish a package version with immutable signed artifact metadata.
+    pub fn publish_signed(
+        &mut self,
+        name: &str,
+        version: SemVer,
+        description: &str,
+        checksum: &str,
+        signature: &str,
+    ) -> Result<(), String> {
+        if checksum.is_empty() || signature.is_empty() {
+            return Err("checksum and signature must be non-empty".to_string());
+        }
+
+        let key = (name.to_string(), version.clone());
+        if let Some(existing) = self.artifacts.get(&key) {
+            if existing.checksum != checksum || existing.signature != signature {
+                return Err(format!(
+                    "immutable artifact conflict for {} {}",
+                    name, version
+                ));
+            }
+            return Ok(());
+        }
+
+        if !self.publish(name, version.clone(), description) {
+            return Err(format!("version {} of '{}' already published", version, name));
+        }
+
+        self.artifacts.insert(
+            key,
+            ArtifactMetadata {
+                checksum: checksum.to_string(),
+                signature: signature.to_string(),
+            },
+        );
+        Ok(())
+    }
+
     /// Search for packages matching a query.
     pub fn search(&self, query: &str) -> Vec<&RegistryEntry> {
         self.packages.values()
@@ -354,6 +405,17 @@ impl Registry {
             .cloned()
     }
 
+    /// Resolve the latest compatible version and include immutable artifact metadata when present.
+    pub fn resolve_with_metadata(
+        &self,
+        name: &str,
+        req: &VersionReq,
+    ) -> Option<(SemVer, Option<ArtifactMetadata>)> {
+        let version = self.resolve(name, req)?;
+        let metadata = self.artifacts.get(&(name.to_string(), version.clone())).cloned();
+        Some((version, metadata))
+    }
+
     /// Download (increment counter) a package.
     pub fn download(&mut self, name: &str) -> bool {
         if let Some(entry) = self.packages.get_mut(name) {
@@ -367,6 +429,85 @@ impl Registry {
     pub fn package_count(&self) -> usize {
         self.packages.len()
     }
+
+    /// Verify a signed index entry using the deterministic built-in signer.
+    pub fn verify_index_entry(&self, name: &str, version: &SemVer) -> Result<(), String> {
+        let meta = self
+            .artifacts
+            .get(&(name.to_string(), version.clone()))
+            .ok_or_else(|| format!("missing signed index metadata for {} {}", name, version))?;
+
+        let expected = compute_registry_signature(name, version, &meta.checksum);
+        if meta.signature != expected {
+            return Err(format!("signature verification failed for {} {}", name, version));
+        }
+        Ok(())
+    }
+}
+
+/// Tiny deterministic FNV-1a hash used for local signature simulation.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Compute a deterministic signature for a registry index entry.
+pub fn compute_registry_signature(name: &str, version: &SemVer, checksum: &str) -> String {
+    let payload = format!("{}@{}:{}", name, version, checksum);
+    format!("sig:{:016x}", fnv1a64(payload.as_bytes()))
+}
+
+/// Local package cache used for offline installs.
+#[derive(Debug, Default)]
+pub struct PackageCache {
+    entries: BTreeMap<(String, SemVer), String>,
+}
+
+impl PackageCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_cached_artifact(&mut self, name: &str, version: SemVer, checksum: &str) {
+        self.entries
+            .insert((name.to_string(), version), checksum.to_string());
+    }
+
+    /// Verify all registry lock entries can be installed from cache without checksum drift.
+    pub fn verify_offline_install(&self, lockfile: &Lockfile) -> Result<(), String> {
+        for entry in &lockfile.entries {
+            if !entry.source.starts_with("registry:") {
+                continue;
+            }
+
+            let expected = entry
+                .checksum
+                .as_ref()
+                .ok_or_else(|| format!("missing checksum in lockfile for '{} {}'", entry.name, entry.version))?;
+
+            let actual = self
+                .entries
+                .get(&(entry.name.clone(), entry.version.clone()))
+                .ok_or_else(|| {
+                    format!(
+                        "offline cache miss for '{} {}'",
+                        entry.name, entry.version
+                    )
+                })?;
+
+            if actual != expected {
+                return Err(format!(
+                    "checksum mismatch for '{} {}': expected {}, got {}",
+                    entry.name, entry.version, expected, actual
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 // ─── Dependency Resolver ────────────────────────────────────────────────
@@ -378,7 +519,11 @@ pub fn resolve_dependencies(
 ) -> Result<Lockfile, String> {
     let mut lockfile = Lockfile::new();
 
-    for dep in &manifest.dependencies {
+    // Deterministic solver input ordering for reproducible lockfiles.
+    let mut deps: Vec<&Dependency> = manifest.dependencies.iter().collect();
+    deps.sort_by(|a, b| a.name.cmp(&b.name));
+
+    for dep in deps {
         let req = VersionReq::parse(&dep.version_req)
             .ok_or_else(|| format!("Invalid version requirement: {}", dep.version_req))?;
 
@@ -400,17 +545,19 @@ pub fn resolve_dependencies(
             });
         } else {
             // Registry dependency
-            let resolved = registry.resolve(&dep.name, &req)
+            let (resolved, metadata) = registry.resolve_with_metadata(&dep.name, &req)
                 .ok_or_else(|| format!("No version of '{}' satisfies {}", dep.name, dep.version_req))?;
 
             lockfile.add(LockEntry {
                 name: dep.name.clone(),
                 version: resolved,
-                checksum: None,
+                checksum: metadata.map(|m| m.checksum),
                 source: "registry:vitalis.io".to_string(),
             });
         }
     }
+
+    lockfile.sort_stable();
 
     Ok(lockfile)
 }
@@ -619,5 +766,84 @@ mod tests {
         let lockfile = resolve_dependencies(&manifest, &reg).unwrap();
         assert_eq!(lockfile.entries.len(), 1);
         assert!(lockfile.entries[0].source.starts_with("path:"));
+    }
+
+    #[test]
+    fn test_publish_signed_and_verify_index_entry() {
+        let mut reg = Registry::new();
+        let version = SemVer::new(1, 2, 3);
+        let checksum = "sha256:abc123";
+        let sig = compute_registry_signature("core", &version, checksum);
+
+        reg.publish_signed("core", version.clone(), "Core", checksum, &sig)
+            .unwrap();
+        assert!(reg.verify_index_entry("core", &version).is_ok());
+    }
+
+    #[test]
+    fn test_publish_signed_immutable_conflict() {
+        let mut reg = Registry::new();
+        let version = SemVer::new(1, 0, 0);
+        let checksum = "sha256:a";
+        let sig = compute_registry_signature("math", &version, checksum);
+        reg.publish_signed("math", version.clone(), "Math", checksum, &sig)
+            .unwrap();
+
+        let conflict_sig = compute_registry_signature("math", &version, "sha256:other");
+        let result = reg.publish_signed("math", version, "Math", "sha256:other", &conflict_sig);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_dependencies_deterministic_order() {
+        let mut reg = Registry::new();
+        reg.publish("alpha", SemVer::new(1, 0, 0), "Alpha");
+        reg.publish("zeta", SemVer::new(1, 0, 0), "Zeta");
+
+        let mut manifest = PackageManifest::new("app", SemVer::new(0, 1, 0));
+        manifest.add_dependency(Dependency::new("zeta", "^1.0"));
+        manifest.add_dependency(Dependency::new("alpha", "^1.0"));
+
+        let lock = resolve_dependencies(&manifest, &reg).unwrap();
+        assert_eq!(lock.entries[0].name, "alpha");
+        assert_eq!(lock.entries[1].name, "zeta");
+    }
+
+    #[test]
+    fn test_offline_cache_verification_ok() {
+        let mut reg = Registry::new();
+        let version = SemVer::new(1, 1, 0);
+        let checksum = "sha256:pkg";
+        let sig = compute_registry_signature("math", &version, checksum);
+        reg.publish_signed("math", version.clone(), "Math", checksum, &sig)
+            .unwrap();
+
+        let mut manifest = PackageManifest::new("app", SemVer::new(0, 1, 0));
+        manifest.add_dependency(Dependency::new("math", "^1.0"));
+
+        let lock = resolve_dependencies(&manifest, &reg).unwrap();
+
+        let mut cache = PackageCache::new();
+        cache.add_cached_artifact("math", version, checksum);
+        assert!(cache.verify_offline_install(&lock).is_ok());
+    }
+
+    #[test]
+    fn test_offline_cache_verification_mismatch() {
+        let mut reg = Registry::new();
+        let version = SemVer::new(1, 1, 0);
+        let checksum = "sha256:pkg";
+        let sig = compute_registry_signature("math", &version, checksum);
+        reg.publish_signed("math", version.clone(), "Math", checksum, &sig)
+            .unwrap();
+
+        let mut manifest = PackageManifest::new("app", SemVer::new(0, 1, 0));
+        manifest.add_dependency(Dependency::new("math", "^1.0"));
+
+        let lock = resolve_dependencies(&manifest, &reg).unwrap();
+
+        let mut cache = PackageCache::new();
+        cache.add_cached_artifact("math", version, "sha256:other");
+        assert!(cache.verify_offline_install(&lock).is_err());
     }
 }
